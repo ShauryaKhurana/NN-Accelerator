@@ -1,0 +1,24 @@
+# Simulator build products and logs (directory kept via .gitkeep)
+sim/*
+!sim/.gitkeep
+obj_dir/
+*.vvp
+*.out
+*.log
+
+# Generated test vectors and waveforms (directories kept via .gitkeep)
+vectors/*
+!vectors/.gitkeep
+waveforms/*
+!waveforms/.gitkeep
+*.vcd
+*.fst
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editor
+.DS_Store
+.vscode/
