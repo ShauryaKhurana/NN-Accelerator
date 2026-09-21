@@ -1,7 +1,8 @@
 # NN-Accelerator
 
-An INT8 neural-network accelerator written in synthesizable SystemVerilog, fully
-simulated and verified against a Python/NumPy golden model. No FPGA required.
+An INT8 neural-network accelerator in synthesizable SystemVerilog, being built to
+run entirely in simulation and to be verified against a Python/NumPy golden
+model. No FPGA required.
 
 The project is built incrementally; each phase must pass its tests before the
 next one starts.
@@ -11,7 +12,7 @@ next one starts.
 | Phase | Block                          | Status      |
 |-------|--------------------------------|-------------|
 | 1     | Signed INT8 MAC unit           | done — verified on Verilator and Icarus |
-| 2     | ReLU                           | not started |
+| 2     | ReLU                           | done — verified on Verilator and Icarus |
 | 3     | 8×8 matrix multiply            | not started |
 | 4     | Control FSM + handshaking      | not started |
 | 5     | NN layer `ReLU(X·W + B)`       | not started |
@@ -59,7 +60,7 @@ Check what is installed with `make check-tools`.
 make test            # Verilator: RTL lint + all testbenches (primary)
 make test-iverilog   # Icarus Verilog: the same testbenches (cross-check)
 make mac SEED=1234   # one testbench with a different random seed
-make mac-waves       # short run that writes waveforms/mac_tb.vcd
+make mac-waves       # short run that writes waveforms/mac_tb.vcd (also: relu-waves)
 make help            # list every target
 ```
 
@@ -67,8 +68,8 @@ Every testbench prints a single `TEST PASSED` / `TEST FAILED` line. A failure
 exits nonzero, so `make` stops. Logs go to `sim/<run>.<simulator>.log`.
 
 To view a waveform: `surfer waveforms/mac_tb.vcd` (GTKWave also reads VCD if
-you have it). The waveform run records the directed tests: reset, products,
-accumulation, hold, clear and clear+load.
+you have it). Waveform runs record only a testbench's directed sections, which
+keeps the files around 20 KB. Add `+dumpall` to record everything.
 
 ## Phase 1: MAC unit (`rtl/mac.sv`)
 
@@ -108,3 +109,31 @@ tests also check values worked out by hand.
 Measured results (seed 1): 347,723 cycles and 347,754 checks with 0 errors on
 both Verilator 5.052 and Icarus 13.0. A second parameterization
 (INT4 × INT4 → 12-bit accumulator) also passes on both.
+
+## Phase 2: ReLU (`rtl/relu.sv`)
+
+`y = (x < 0) ? 0 : x` for signed `WIDTH`-bit values (`WIDTH=32` by default).
+The module is purely combinational.
+
+- A two's-complement value is negative exactly when its sign bit is set, so
+  the sign bit selects between `x` and 0. No comparator is needed. At gate
+  level this is one AND gate per bit: `y[i] = x[i] & ~x[WIDTH-1]`.
+- The output is never negative. It keeps the input's signed type so it can
+  feed signed arithmetic directly.
+
+**Verification (`tb/relu_tb.sv`).** Each check drives `x`, waits 1 ns, and
+compares `y` with a 64-bit reference model. The model uses a signed
+comparison, while the RTL uses the sign bit.
+
+| Section      | What it covers                                                    |
+|--------------|-------------------------------------------------------------------|
+| Boundaries   | 0, ±1, ±2, ±100, MAX, MAX−1, MIN, MIN+1                            |
+| Bit patterns | walking-one and walking-zero with the sign bit clear (passes through) and set (becomes 0), for every magnitude bit |
+| Exhaustive   | every input value when `WIDTH ≤ 16` (all 65,536 for `WIDTH=16`)   |
+| Random       | 100,000 values: uniform, near zero, and near MAX/MIN              |
+| Coverage     | every input bit seen at 0 and 1; every output magnitude bit seen at 1; output sign bit never set |
+
+Measured results (seed 1), with 0 errors on both Verilator 5.052 and Icarus 13.0:
+
+- `WIDTH=32`: 100,135 checks.
+- `WIDTH=16`: 165,607 checks, including the exhaustive sweep.

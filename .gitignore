@@ -22,3 +22,7 @@ __pycache__/
 # OS / editor
 .DS_Store
 .vscode/
+
+# Local notes, kept out of the repository
+/prompt.md
+/claude_prompt.md

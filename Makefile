@@ -5,11 +5,15 @@
 #
 #   make test          lint + every testbench on Verilator (primary simulator)
 #   make test-iverilog every testbench on Icarus Verilog (cross-check)
-#   make lint          Verilator -Wall lint of the RTL
+#   make lint          Verilator -Wall lint of every RTL module
 #   make mac           MAC testbench, INT8 x INT8 -> INT32 (Verilator)
 #   make mac-params    MAC testbench, INT4 x INT4 -> INT12 (parameterization check)
 #   make mac-iverilog  both MAC configurations on Icarus Verilog
 #   make mac-waves     short MAC run that writes waveforms/mac_tb.vcd
+#   make relu          ReLU testbench, WIDTH=32 (Verilator)
+#   make relu-params   ReLU testbench, WIDTH=16, exhaustive over all inputs
+#   make relu-iverilog both ReLU configurations on Icarus Verilog
+#   make relu-waves    short ReLU run that writes waveforms/relu_tb.vcd
 #   make check-tools   report which simulators / tools are installed
 #   make clean         remove simulation build products
 #
@@ -29,7 +33,11 @@ WAVE_DIR := waveforms
 SEED ?= 1
 
 # ---- Sources ----------------------------------------------------------------
-MAC_RTL := rtl/mac.sv
+MAC_RTL  := rtl/mac.sv
+RELU_RTL := rtl/relu.sv
+RTL_SRCS := $(MAC_RTL) $(RELU_RTL)
+# Each of these modules is linted as a top level against the full RTL list.
+LINT_TOPS := mac relu
 
 # ---- Verilator --------------------------------------------------------------
 # --binary       build a standalone simulator from an SV testbench (implies --timing)
@@ -66,20 +74,25 @@ define iverilog_run
 	@grep -q '^TEST PASSED' $(SIM_DIR)/$(3).iverilog.log
 endef
 
-.PHONY: help check-tools lint test test-iverilog mac mac-params mac-iverilog mac-waves clean
+.PHONY: help check-tools lint test test-iverilog clean \
+        mac mac-params mac-iverilog mac-waves \
+        relu relu-params relu-iverilog relu-waves
 
 help:
 	@grep -E '^#   (make |[A-Z]+=)' Makefile | sed 's/^#   //'
 
-test: lint mac mac-params
+test: lint mac mac-params relu relu-params
 	@echo "== make test: all Verilator checks passed =="
 
-test-iverilog: mac-iverilog
+test-iverilog: mac-iverilog relu-iverilog
 	@echo "== make test-iverilog: all Icarus checks passed =="
 
 lint:
-	$(VERILATOR) --lint-only -Wall --quiet --top-module mac $(MAC_RTL)
-	@echo "lint: rtl/mac.sv clean under verilator -Wall"
+	@for top in $(LINT_TOPS); do \
+	    echo "$(VERILATOR) --lint-only -Wall --quiet --top-module $$top $(RTL_SRCS)"; \
+	    $(VERILATOR) --lint-only -Wall --quiet --top-module $$top $(RTL_SRCS) || exit 1; \
+	done
+	@echo "lint: $(LINT_TOPS) clean under verilator -Wall"
 
 mac:
 	$(call verilator_run,mac_tb,$(MAC_RTL) tb/mac_tb.sv,mac_tb,)
@@ -96,6 +109,20 @@ mac-iverilog:
 mac-waves:
 	$(call verilator_run,mac_tb,$(MAC_RTL) tb/mac_tb.sv,mac_tb,,+dumpfile=$(WAVE_DIR)/mac_tb.vcd)
 	@echo "wrote $(WAVE_DIR)/mac_tb.vcd -- open it with: surfer $(WAVE_DIR)/mac_tb.vcd"
+
+relu:
+	$(call verilator_run,relu_tb,$(RELU_RTL) tb/relu_tb.sv,relu_tb,)
+
+relu-params:
+	$(call verilator_run,relu_tb,$(RELU_RTL) tb/relu_tb.sv,relu_tb_w16,-GWIDTH=16)
+
+relu-iverilog:
+	$(call iverilog_run,relu_tb,$(RELU_RTL) tb/relu_tb.sv,relu_tb,)
+	$(call iverilog_run,relu_tb,$(RELU_RTL) tb/relu_tb.sv,relu_tb_w16,-Prelu_tb.WIDTH=16)
+
+relu-waves:
+	$(call verilator_run,relu_tb,$(RELU_RTL) tb/relu_tb.sv,relu_tb,,+dumpfile=$(WAVE_DIR)/relu_tb.vcd)
+	@echo "wrote $(WAVE_DIR)/relu_tb.vcd -- open it with: surfer $(WAVE_DIR)/relu_tb.vcd"
 
 check-tools:
 	@for t in $(VERILATOR) $(IVERILOG) $(VVP) $(PYTHON); do \
