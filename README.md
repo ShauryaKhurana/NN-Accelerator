@@ -13,7 +13,7 @@ next one starts.
 |-------|--------------------------------|-------------|
 | 1     | Signed INT8 MAC unit           | done — verified on Verilator and Icarus |
 | 2     | ReLU                           | done — verified on Verilator and Icarus |
-| 3     | 8×8 matrix multiply            | not started |
+| 3     | 8×8 matrix multiply            | done — verified on Verilator and Icarus, and against NumPy |
 | 4     | Control FSM + handshaking      | not started |
 | 5     | NN layer `ReLU(X·W + B)`       | not started |
 | 6     | Two-layer network (16→32→10)   | not started |
@@ -29,7 +29,7 @@ next one starts.
 ```
 rtl/        synthesizable SystemVerilog
 tb/         SystemVerilog testbenches
-python/     golden model, vector generation, result checking
+python/     NumPy golden model and RTL result checking
 sim/        simulator build products and logs (generated, git-ignored)
 vectors/    generated test vectors (git-ignored)
 waveforms/  VCD/FST dumps (git-ignored)
@@ -44,12 +44,12 @@ brew install icarus-verilog   # secondary simulator for cross-checking
 brew install surfer           # waveform viewer (the GTKWave cask was disabled in 2025)
 ```
 
-Python dependencies (needed from Phase 3). Homebrew's Python refuses global
-`pip install` (PEP 668), so use a project virtual environment:
+Python dependencies (NumPy, listed in `requirements.txt`). Homebrew's Python
+refuses global `pip install` (PEP 668), so the project uses a virtual
+environment, and the Makefile picks up `.venv` automatically:
 
 ```sh
-python3 -m venv .venv
-.venv/bin/pip install numpy
+make venv            # python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 Check what is installed with `make check-tools`.
@@ -60,7 +60,7 @@ Check what is installed with `make check-tools`.
 make test            # Verilator: RTL lint + all testbenches (primary)
 make test-iverilog   # Icarus Verilog: the same testbenches (cross-check)
 make mac SEED=1234   # one testbench with a different random seed
-make mac-waves       # short run that writes waveforms/mac_tb.vcd (also: relu-waves)
+make mac-waves       # short run that writes waveforms/mac_tb.vcd (also relu-, matmul-waves)
 make help            # list every target
 ```
 
@@ -69,7 +69,8 @@ exits nonzero, so `make` stops. Logs go to `sim/<run>.<simulator>.log`.
 
 To view a waveform: `surfer waveforms/mac_tb.vcd` (GTKWave also reads VCD if
 you have it). Waveform runs record only a testbench's directed sections, which
-keeps the files around 20 KB. Add `+dumpall` to record everything.
+keeps the files small: about 20 KB for the MAC and ReLU, and 1.4 MB for the
+matrix multiply. Add `+dumpall` to record everything.
 
 ## Phase 1: MAC unit (`rtl/mac.sv`)
 
@@ -137,3 +138,65 @@ Measured results (seed 1), with 0 errors on both Verilator 5.052 and Icarus 13.0
 
 - `WIDTH=32`: 100,135 checks.
 - `WIDTH=16`: 165,607 checks, including the exhaustive sweep.
+
+## Phase 3: matrix multiply (`rtl/matrix_mult.sv`)
+
+`C = A × B` with A (M×K) and B (K×N) signed INT8 and C (M×N) signed INT32.
+The default is 8×8×8, and M, K and N are parameters. This is the simplest
+correct architecture: a single Phase 1 MAC does all the work.
+
+```
+          start
+            |
+ a_flat -->[ A regs, M x K ]-- A[i][k] --+
+                                         +-->[ mac ]-- acc -->[ C regs, M x N ]--> c_flat
+ b_flat -->[ B regs, K x N ]-- B[k][j] --+       ^                 ^
+                                                 | en, clear       | write C[i][j]
+           [ sequencer: k fastest, then j, then i ]+----------------+
+```
+
+- **Operands:** `start` copies A and B from flat, row-major buses into local
+  registers.
+- **Compute:** counters issue one multiply-accumulate per clock. The first
+  term of each dot product uses the MAC's clear+en load, so consecutive dot
+  products need no idle cycle.
+- **Write-back:** each finished sum is written into C one cycle after its last
+  term, while the next dot product is already running.
+- **Timing:** latency is M·N·K + 1 = 513 cycles from the start edge to the
+  one-cycle `done` pulse. Back-to-back runs start every M·N·K + 2 = 514
+  cycles. The MAC is active for 512 of them.
+- **Control:** a minimal counter sequencer. Phase 4 replaces it with a proper
+  FSM and a valid/ready interface.
+
+**Verification.** Two independent references check every result:
+
+1. **Testbench (`tb/matrix_mult_tb.sv`):** compares all M·N elements against
+   a 64-bit reference model, and checks that `done` arrives exactly at the
+   documented latency.
+2. **NumPy golden model (`python/golden_model.py`):** the testbench writes each
+   multiply's A, B, and the C read back from the DUT to a results file, and
+   `python/verify_results.py` recomputes C with NumPy and compares every
+   element.
+
+| Section   | What it covers                                                     |
+|-----------|--------------------------------------------------------------------|
+| Directed  | identity × B, A × identity, zeros, all 127, all −128, −128 × 127, a checkerboard of extremes, an index pattern with distinct elements |
+| Protocol  | back-to-back starts, starts after idle cycles, start ignored while busy, reset in the middle of a run |
+| Random    | 200 seeded matrix pairs, biased toward corner values               |
+| Coverage  | positive, negative and zero elements; the largest (K·16384) and most negative (K·−16256) possible elements; each protocol case |
+
+The golden model has its own self-test (`make golden`). It is checked against
+plain Python integer arithmetic on 72 matrix pairs, plus hand-computed values.
+It multiplies in int64 on purpose: NumPy's `int8 @ int8` wraps, and for the
+all −128 case it returns 0 instead of 131,072.
+
+Measured results (seed 1), with 0 errors on both Verilator 5.052 and Icarus
+13.0, and every element matching NumPy:
+
+| Shape (M×K×N) | Multiplies | Testbench checks | Elements vs. NumPy | Latency |
+|---------------|------------|------------------|--------------------|---------|
+| 8×8×8         | 210        | 13,866           | 13,440             | 513     |
+| 3×16×5        | 210        | 3,576            | 3,150              | 241     |
+| 1×16×8        | 210        | 2,106            | 1,680              | 129     |
+
+For each shape, the Verilator and Icarus results files are byte-identical.

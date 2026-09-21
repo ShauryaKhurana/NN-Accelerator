@@ -14,6 +14,12 @@
 #   make relu-params   ReLU testbench, WIDTH=16, exhaustive over all inputs
 #   make relu-iverilog both ReLU configurations on Icarus Verilog
 #   make relu-waves    short ReLU run that writes waveforms/relu_tb.vcd
+#   make matmul        8x8 matrix multiply testbench + NumPy check (Verilator)
+#   make matmul-params matrix multiply at 3x16x5 and 1x16x8, + NumPy check
+#   make matmul-iverilog  all matrix multiply configurations on Icarus Verilog
+#   make matmul-waves  short matrix multiply run that writes waveforms/matrix_mult_tb.vcd
+#   make golden        self-test of the NumPy golden model (python/golden_model.py)
+#   make venv          create .venv with the Python dependencies (numpy)
 #   make check-tools   report which simulators / tools are installed
 #   make clean         remove simulation build products
 #
@@ -25,7 +31,8 @@ SHELL := /bin/bash
 VERILATOR ?= verilator
 IVERILOG  ?= iverilog
 VVP       ?= vvp
-PYTHON    ?= python3
+# Use the project virtual environment (make venv) when it exists
+PYTHON    ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
 SIM_DIR  := sim
 WAVE_DIR := waveforms
@@ -33,11 +40,12 @@ WAVE_DIR := waveforms
 SEED ?= 1
 
 # ---- Sources ----------------------------------------------------------------
-MAC_RTL  := rtl/mac.sv
-RELU_RTL := rtl/relu.sv
-RTL_SRCS := $(MAC_RTL) $(RELU_RTL)
+MAC_RTL     := rtl/mac.sv
+RELU_RTL    := rtl/relu.sv
+MATMUL_RTL  := $(MAC_RTL) rtl/matrix_mult.sv
+RTL_SRCS    := $(MAC_RTL) $(RELU_RTL) rtl/matrix_mult.sv
 # Each of these modules is linted as a top level against the full RTL list.
-LINT_TOPS := mac relu
+LINT_TOPS   := mac relu matrix_mult
 
 # ---- Verilator --------------------------------------------------------------
 # --binary       build a standalone simulator from an SV testbench (implies --timing)
@@ -74,17 +82,18 @@ define iverilog_run
 	@grep -q '^TEST PASSED' $(SIM_DIR)/$(3).iverilog.log
 endef
 
-.PHONY: help check-tools lint test test-iverilog clean \
+.PHONY: help check-tools lint test test-iverilog clean venv golden \
         mac mac-params mac-iverilog mac-waves \
-        relu relu-params relu-iverilog relu-waves
+        relu relu-params relu-iverilog relu-waves \
+        matmul matmul-params matmul-iverilog matmul-waves
 
 help:
 	@grep -E '^#   (make |[A-Z]+=)' Makefile | sed 's/^#   //'
 
-test: lint mac mac-params relu relu-params
+test: lint golden mac mac-params relu relu-params matmul matmul-params
 	@echo "== make test: all Verilator checks passed =="
 
-test-iverilog: mac-iverilog relu-iverilog
+test-iverilog: golden mac-iverilog relu-iverilog matmul-iverilog
 	@echo "== make test-iverilog: all Icarus checks passed =="
 
 lint:
@@ -124,6 +133,38 @@ relu-waves:
 	$(call verilator_run,relu_tb,$(RELU_RTL) tb/relu_tb.sv,relu_tb,,+dumpfile=$(WAVE_DIR)/relu_tb.vcd)
 	@echo "wrote $(WAVE_DIR)/relu_tb.vcd -- open it with: surfer $(WAVE_DIR)/relu_tb.vcd"
 
+# Matrix multiply: the testbench checks C against its own reference model and
+# also writes every multiply to a results file, which python/verify_results.py
+# re-checks against the NumPy golden model.
+# $(call matmul_run,<simulator run macro>,<run name>,<build flags>,<simulator>)
+define matmul_run
+	$(call $(1),matrix_mult_tb,$(MATMUL_RTL) tb/matrix_mult_tb.sv,$(2),$(3),+resultsfile=$(SIM_DIR)/$(2).$(4).results.txt)
+	$(PYTHON) python/verify_results.py matmul $(SIM_DIR)/$(2).$(4).results.txt
+endef
+
+matmul:
+	$(call matmul_run,verilator_run,matrix_mult_tb,,verilator)
+
+matmul-params:
+	$(call matmul_run,verilator_run,matrix_mult_tb_3x16x5,-GM=3 -GK=16 -GN=5,verilator)
+	$(call matmul_run,verilator_run,matrix_mult_tb_1x16x8,-GM=1 -GK=16 -GN=8,verilator)
+
+matmul-iverilog:
+	$(call matmul_run,iverilog_run,matrix_mult_tb,,iverilog)
+	$(call matmul_run,iverilog_run,matrix_mult_tb_3x16x5,-Pmatrix_mult_tb.M=3 -Pmatrix_mult_tb.K=16 -Pmatrix_mult_tb.N=5,iverilog)
+	$(call matmul_run,iverilog_run,matrix_mult_tb_1x16x8,-Pmatrix_mult_tb.M=1 -Pmatrix_mult_tb.K=16 -Pmatrix_mult_tb.N=8,iverilog)
+
+matmul-waves:
+	$(call verilator_run,matrix_mult_tb,$(MATMUL_RTL) tb/matrix_mult_tb.sv,matrix_mult_tb,,+dumpfile=$(WAVE_DIR)/matrix_mult_tb.vcd)
+	@echo "wrote $(WAVE_DIR)/matrix_mult_tb.vcd -- open it with: surfer $(WAVE_DIR)/matrix_mult_tb.vcd"
+
+golden:
+	$(PYTHON) python/golden_model.py
+
+venv:
+	python3 -m venv .venv
+	.venv/bin/pip install -r requirements.txt
+
 check-tools:
 	@for t in $(VERILATOR) $(IVERILOG) $(VVP) $(PYTHON); do \
 	    if command -v $$t >/dev/null 2>&1; then printf '  %-10s %s\n' $$t "$$(command -v $$t)"; \
@@ -131,7 +172,8 @@ check-tools:
 	done
 	@$(VERILATOR) --version 2>/dev/null || true
 	@$(IVERILOG) -V 2>/dev/null | head -1 || true
+	@$(PYTHON) -c "import numpy; print('numpy', numpy.__version__)" 2>/dev/null || echo "numpy: MISSING (run make venv)"
 
 clean:
-	rm -rf $(SIM_DIR)/verilator $(SIM_DIR)/iverilog $(SIM_DIR)/*.log
+	rm -rf $(SIM_DIR)/verilator $(SIM_DIR)/iverilog $(SIM_DIR)/*.log $(SIM_DIR)/*.txt
 	rm -f $(WAVE_DIR)/*.vcd $(WAVE_DIR)/*.fst
