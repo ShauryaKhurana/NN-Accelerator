@@ -1,7 +1,8 @@
 # NN-Accelerator
 
-An INT8 neural-network accelerator written in synthesizable SystemVerilog, fully
-simulated and verified against a Python/NumPy golden model. No FPGA required.
+An INT8 neural-network accelerator in synthesizable SystemVerilog, being built to
+run entirely in simulation and to be verified against a Python/NumPy golden
+model. No FPGA required.
 
 The project is built incrementally; each phase must pass its tests before the
 next one starts.
