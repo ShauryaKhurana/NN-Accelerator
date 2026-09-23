@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the hardware as built so far. It will grow as later
-phases add the multi-layer network, parallel MACs and pipelining.
+phases add parallel MACs and pipelining.
 
 ## Blocks
 
@@ -12,6 +12,8 @@ phases add the multi-layer network, parallel MACs and pipelining.
 | Matrix multiply| `rtl/matrix_mult.sv`  | Streaming C = A × B datapath: operand memory + one MAC      |
 | Controller     | `rtl/matmul_ctrl.sv`  | FSM that sequences a matrix-multiply job                    |
 | Layer          | `rtl/nn_layer.sv`     | `Y = ReLU(X · W + B)`: the multiplier plus bias and ReLU    |
+| Requantizer    | `rtl/requant.sv`      | INT32 activation → INT8: shift, then saturate               |
+| Network        | `rtl/nn_accelerator.sv` | Two layers chained through the requantizer                |
 | Shared types   | `rtl/matmul_pkg.sv`   | Controller state encoding                                   |
 
 ## Matrix multiplier
@@ -211,3 +213,69 @@ Measured back-to-back periods: 282 cycles at 16 → 8, 33 at 4 → 3, and 684 at
 32 → 10, each matching the formula. Loading the weights dominates: 144 of the
 282 cycles. A design that kept weights on-chip across inferences would not
 pay it every time, which is one of the things Phases 7 and 8 look at.
+
+## Requantizer
+
+Between two INT8 layers the activations have to come back down to INT8: a
+layer accumulates in INT32, but the next layer's multiplier takes INT8.
+
+```
+  x (INT32) --->[ >>> SHIFT ]--->[ saturate to OUT_WIDTH ]---> y (INT8)
+                 arithmetic          clamp, do not wrap
+```
+
+- **Power-of-two scale.** Restricting the rescaling factor to a power of two
+  makes it a constant shift, which is wiring, plus two comparisons and a mux.
+  The general version multiplies by a fixed-point scale first.
+- **Rounding.** The shift is arithmetic, so it rounds toward negative
+  infinity, the same as `>>` on a signed integer in Python or NumPy. The
+  hidden activations arrive after ReLU, so they are never negative, but the
+  module is tested with negatives too.
+- **Saturation, not wrapping.** A large activation becomes the largest
+  representable value instead of changing sign.
+- **Choosing SHIFT.** With K INT8 inputs, sums reach about K · 2¹⁴. The
+  default 8 keeps typical activations of a 16-input layer around 70 and
+  saturates only the largest few percent. It is a parameter, so it can be
+  swept.
+
+## Two-layer network
+
+```
+  s_data ---+--->[ nn_layer 1: INPUT_SIZE -> HIDDEN_SIZE, ReLU ]
+  (INT8)    |            |
+  X, W1, W2 |            | activations (INT32, non-negative)
+            |            v
+            |      [ requant: >>> SHIFT, saturate ]
+            |            | INT8
+            |            v
+            +--->[ nn_layer 2: HIDDEN_SIZE -> OUTPUT_SIZE, no ReLU ]---> m_data
+              W2                                                         (INT32 logits)
+```
+
+The default shape is 16 → 32 → 10. Layer 2 has `APPLY_RELU = 0`, because the
+output layer produces raw logits.
+
+- **Routing.** One counter tracks how many beats have been taken from the
+  host. The first INPUT_SIZE + INPUT_SIZE·HIDDEN_SIZE of them feed layer 1. A
+  second counter tracks the activations handed to layer 2. Until all
+  HIDDEN_SIZE of them have gone through, `s_ready` stays low for the W2 beats,
+  so the host simply waits.
+- **Overlap.** Layer 2 loads its activations while layer 1 is still computing
+  the later ones, so an inference costs less than two separate layers.
+
+### Cycles per inference
+
+| Phase                                             | Cycles                          | 16 → 32 → 10 |
+|---------------------------------------------------|---------------------------------|--------------|
+| IDLE, seeing the first beat                       | 1                               | 1            |
+| Layer 1 loads X and W1                            | INPUT_SIZE·(1 + HIDDEN_SIZE)    | 528          |
+| Layer 1 computes (+1 while layer 2 leaves IDLE)   | HIDDEN_SIZE·(INPUT_SIZE+1) + 1  | 545          |
+| Layer 2 loads W2                                  | HIDDEN_SIZE·OUTPUT_SIZE         | 320          |
+| Layer 2 computes                                  | OUTPUT_SIZE·(HIDDEN_SIZE+1)     | 330          |
+| DONE                                              | 1                               | 1            |
+| **Back to back**                                  | **the sum of the above**        | **1,725**    |
+
+Measured: 1,724 busy cycles and 1,725 between back-to-back inferences at
+16 → 32 → 10, and 48 at 4 → 3 → 2, both matching the formula. Of those 1,725
+cycles, 848 are spent loading weights and 874 computing, which is what Phases
+7 and 8 will attack.

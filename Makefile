@@ -26,6 +26,13 @@
 #   make layer-params  NN layer at 4->3 and 32->10, + NumPy check
 #   make layer-iverilog  all NN layer configurations on Icarus Verilog
 #   make layer-waves   short NN layer run that writes waveforms/nn_layer_tb.vcd
+#   make requant       requantizer testbench, INT32 -> INT8 (Verilator)
+#   make requant-params  requantizer at 16->4 bits, exhaustive over all inputs
+#   make requant-iverilog  both requantizer configurations on Icarus Verilog
+#   make net           two-layer network 16-32-10 + NumPy check (Verilator)
+#   make net-params    network at 4-3-2, and with SHIFT=0, + NumPy check
+#   make net-iverilog  all network configurations on Icarus Verilog
+#   make net-waves     short network run that writes waveforms/nn_accelerator_tb.vcd
 #   make golden        self-test of the NumPy golden model (python/golden_model.py)
 #   make venv          create .venv with the Python dependencies (numpy)
 #   make check-tools   report which simulators / tools are installed
@@ -53,9 +60,12 @@ RELU_RTL    := rtl/relu.sv
 CTRL_RTL    := rtl/matmul_pkg.sv rtl/matmul_ctrl.sv
 MATMUL_RTL  := rtl/matmul_pkg.sv $(MAC_RTL) rtl/matmul_ctrl.sv rtl/matrix_mult.sv
 LAYER_RTL   := $(MATMUL_RTL) $(RELU_RTL) rtl/nn_layer.sv
-RTL_SRCS    := rtl/matmul_pkg.sv $(MAC_RTL) $(RELU_RTL) rtl/matmul_ctrl.sv rtl/matrix_mult.sv rtl/nn_layer.sv
+REQUANT_RTL := rtl/requant.sv
+NET_RTL     := $(LAYER_RTL) $(REQUANT_RTL) rtl/nn_accelerator.sv
+RTL_SRCS    := rtl/matmul_pkg.sv $(MAC_RTL) $(RELU_RTL) $(REQUANT_RTL) rtl/matmul_ctrl.sv \
+               rtl/matrix_mult.sv rtl/nn_layer.sv rtl/nn_accelerator.sv
 # Each of these modules is linted as a top level against the full RTL list.
-LINT_TOPS   := mac relu matmul_ctrl matrix_mult nn_layer
+LINT_TOPS   := mac relu requant matmul_ctrl matrix_mult nn_layer nn_accelerator
 
 # ---- Verilator --------------------------------------------------------------
 # --binary       build a standalone simulator from an SV testbench (implies --timing)
@@ -102,16 +112,19 @@ endef
         relu relu-params relu-iverilog relu-waves \
         ctrl ctrl-params ctrl-iverilog ctrl-waves \
         matmul matmul-params matmul-iverilog matmul-waves \
-        layer layer-params layer-iverilog layer-waves
+        layer layer-params layer-iverilog layer-waves \
+        requant requant-params requant-iverilog \
+        net net-params net-iverilog net-waves
 
 help:
 	@grep -E '^#   (make |[A-Z_]+=)' Makefile | sed 's/^#   //'
 
 test: lint golden mac mac-params relu relu-params ctrl ctrl-params matmul matmul-params \
-      layer layer-params
+      layer layer-params requant requant-params net net-params
 	@echo "== make test: all Verilator checks passed =="
 
-test-iverilog: golden mac-iverilog relu-iverilog ctrl-iverilog matmul-iverilog layer-iverilog
+test-iverilog: golden mac-iverilog relu-iverilog ctrl-iverilog matmul-iverilog layer-iverilog \
+               requant-iverilog net-iverilog
 	@echo "== make test-iverilog: all Icarus checks passed =="
 
 lint:
@@ -206,11 +219,47 @@ layer:
 layer-params:
 	$(call layer_run,verilator_run,nn_layer_tb_4x3,-GINPUT_SIZE=4 -GOUTPUT_SIZE=3,verilator)
 	$(call layer_run,verilator_run,nn_layer_tb_32x10,-GINPUT_SIZE=32 -GOUTPUT_SIZE=10,verilator)
+	$(call layer_run,verilator_run,nn_layer_tb_norelu,-GAPPLY_RELU=0,verilator)
 
 layer-iverilog:
 	$(call layer_run,iverilog_run,nn_layer_tb,,iverilog)
 	$(call layer_run,iverilog_run,nn_layer_tb_4x3,-Pnn_layer_tb.INPUT_SIZE=4 -Pnn_layer_tb.OUTPUT_SIZE=3,iverilog)
 	$(call layer_run,iverilog_run,nn_layer_tb_32x10,-Pnn_layer_tb.INPUT_SIZE=32 -Pnn_layer_tb.OUTPUT_SIZE=10,iverilog)
+	$(call layer_run,iverilog_run,nn_layer_tb_norelu,-Pnn_layer_tb.APPLY_RELU=0,iverilog)
+
+# Requantizer on its own
+requant:
+	$(call verilator_run,requant_tb,$(REQUANT_RTL) tb/requant_tb.sv,requant_tb,)
+
+requant-params:
+	$(call verilator_run,requant_tb,$(REQUANT_RTL) tb/requant_tb.sv,requant_tb_16x4,-GIN_WIDTH=16 -GOUT_WIDTH=4 -GSHIFT=2)
+
+requant-iverilog:
+	$(call iverilog_run,requant_tb,$(REQUANT_RTL) tb/requant_tb.sv,requant_tb,)
+	$(call iverilog_run,requant_tb,$(REQUANT_RTL) tb/requant_tb.sv,requant_tb_16x4,-Prequant_tb.IN_WIDTH=16 -Prequant_tb.OUT_WIDTH=4 -Prequant_tb.SHIFT=2)
+
+# Two-layer network: testbench plus the NumPy golden model
+# $(call net_run,<simulator run macro>,<run name>,<build flags>,<simulator>)
+define net_run
+	$(call $(1),nn_accelerator_tb,$(NET_RTL) tb/nn_accelerator_tb.sv,$(2),$(3),+resultsfile=$(SIM_DIR)/$(2).$(4).results.txt)
+	$(PYTHON) python/verify_results.py network $(SIM_DIR)/$(2).$(4).results.txt
+endef
+
+net:
+	$(call net_run,verilator_run,nn_accelerator_tb,,verilator)
+
+net-params:
+	$(call net_run,verilator_run,nn_accelerator_tb_4x3x2,-GINPUT_SIZE=4 -GHIDDEN_SIZE=3 -GOUTPUT_SIZE=2,verilator)
+	$(call net_run,verilator_run,nn_accelerator_tb_shift0,-GSHIFT=0,verilator)
+
+net-iverilog:
+	$(call net_run,iverilog_run,nn_accelerator_tb,,iverilog)
+	$(call net_run,iverilog_run,nn_accelerator_tb_4x3x2,-Pnn_accelerator_tb.INPUT_SIZE=4 -Pnn_accelerator_tb.HIDDEN_SIZE=3 -Pnn_accelerator_tb.OUTPUT_SIZE=2,iverilog)
+	$(call net_run,iverilog_run,nn_accelerator_tb_shift0,-Pnn_accelerator_tb.SHIFT=0,iverilog)
+
+net-waves:
+	$(call verilator_run,nn_accelerator_tb,$(NET_RTL) tb/nn_accelerator_tb.sv,nn_accelerator_tb,,+dumpfile=$(WAVE_DIR)/nn_accelerator_tb.vcd)
+	@echo "wrote $(WAVE_DIR)/nn_accelerator_tb.vcd -- open it with: surfer $(WAVE_DIR)/nn_accelerator_tb.vcd"
 
 layer-waves:
 	$(call verilator_run,nn_layer_tb,$(LAYER_RTL) tb/nn_layer_tb.sv,nn_layer_tb,,+dumpfile=$(WAVE_DIR)/nn_layer_tb.vcd)

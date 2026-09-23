@@ -44,6 +44,7 @@ module nn_layer_tb;
     // -------------------------------------------------------------------------
     parameter int INPUT_SIZE  = 16;
     parameter int OUTPUT_SIZE = 8;
+    parameter bit APPLY_RELU  = 1'b1;   // 0 exercises an output layer (raw logits)
     parameter int N_RANDOM    = 200;
 
     localparam int DATA_WIDTH  = 8;
@@ -79,7 +80,8 @@ module nn_layer_tb;
         .INPUT_SIZE  (INPUT_SIZE),
         .OUTPUT_SIZE (OUTPUT_SIZE),
         .DATA_WIDTH  (DATA_WIDTH),
-        .ACC_WIDTH   (ACC_WIDTH)
+        .ACC_WIDTH   (ACC_WIDTH),
+        .APPLY_RELU  (APPLY_RELU)
     ) dut (
         .clk       (clk),
         .rst       (rst),
@@ -244,7 +246,7 @@ module nn_layer_tb;
                 dot += longint'(x_vec[k]) * longint'(w_mat[k][j]);
             total = wrap_acc(dot + bias_v[j]);
             if (total != dot + bias_v[j]) cov_wrap++;
-            y_exp[j] = (total < 0) ? 0 : total;
+            y_exp[j] = (APPLY_RELU && total < 0) ? 0 : total;
 
             if (dot > 0)        cov_dot_pos++;
             if (dot < 0)        cov_dot_neg++;
@@ -430,11 +432,15 @@ module nn_layer_tb;
                  n_jobs - sec_jobs, n_checks - sec_checks, n_errors - sec_errors);
     endtask
 
-    task automatic cover_bin(input string name, input int unsigned hits);
-        $display("  %8d  %s", hits, name);
-        if (hits == 0) begin
-            n_errors++;
-            $display("ERROR coverage hole: '%s' was never exercised", name);
+    task automatic cover_bin(input string name, input int unsigned hits, input bit required);
+        if (!required) begin
+            $display("       n/a  %s (not applicable in this configuration)", name);
+        end else begin
+            $display("  %8d  %s", hits, name);
+            if (hits == 0) begin
+                n_errors++;
+                $display("ERROR coverage hole: '%s' was never exercised", name);
+            end
         end
     endtask
 
@@ -446,12 +452,12 @@ module nn_layer_tb;
         end
         $display("");
         if (n_errors == 0) begin
-            $display("TEST PASSED%s: nn_layer_tb INPUT_SIZE=%0d OUTPUT_SIZE=%0d seed=%0d | %0d inferences, %0d checks, 0 errors, %0d cycles per inference back to back",
-                     run_note, INPUT_SIZE, OUTPUT_SIZE, seed, n_jobs, n_checks, PERIOD);
+            $display("TEST PASSED%s: nn_layer_tb INPUT_SIZE=%0d OUTPUT_SIZE=%0d APPLY_RELU=%0d seed=%0d | %0d inferences, %0d checks, 0 errors, %0d cycles per inference back to back",
+                     run_note, INPUT_SIZE, OUTPUT_SIZE, APPLY_RELU, seed, n_jobs, n_checks, PERIOD);
             $finish;
         end else begin
-            $display("TEST FAILED%s: nn_layer_tb INPUT_SIZE=%0d OUTPUT_SIZE=%0d seed=%0d | %0d errors in %0d checks",
-                     run_note, INPUT_SIZE, OUTPUT_SIZE, seed, n_errors, n_checks);
+            $display("TEST FAILED%s: nn_layer_tb INPUT_SIZE=%0d OUTPUT_SIZE=%0d APPLY_RELU=%0d seed=%0d | %0d errors in %0d checks",
+                     run_note, INPUT_SIZE, OUTPUT_SIZE, APPLY_RELU, seed, n_errors, n_checks);
             $fatal(1, "nn_layer_tb failed");
         end
     endtask
@@ -483,8 +489,9 @@ module nn_layer_tb;
         expect_outputs(dot_all_127, "all 127");
 
         fill_const(-128, 127, 0);
-        directed_job("negative sums clamp to 0", 1'b1);
-        expect_outputs(0, "negative sums clamp to 0");
+        directed_job(APPLY_RELU ? "negative sums clamp to 0" : "negative sums pass through", 1'b1);
+        expect_outputs(APPLY_RELU ? 0 : dot_min_max,
+                       APPLY_RELU ? "negative sums clamp to 0" : "negative sums pass through");
 
         // A bias that lifts a negative sum back up: Y[j] = j, so Y[0] is the
         // exact zero crossing
@@ -521,7 +528,9 @@ module nn_layer_tb;
         // One more wraps to the most negative value, and ReLU clamps it to 0
         fill_const(-128, -128, SAFE_BIAS + 1);
         run_job("one past the safe bias wraps (not logged)", 0, 0, 1'b0);
-        expect_outputs(0, "one past the safe bias wraps to negative, clamped to 0");
+        expect_outputs(APPLY_RELU ? 0 : ACC_MIN,
+                       APPLY_RELU ? "one past the safe bias wraps to negative, clamped to 0"
+                                  : "one past the safe bias wraps to the most negative value");
 
         $display("  pass  every inference: busy %0d cycles; back to back %0d cycles apart",
                  BUSY_CYCLES, PERIOD);
@@ -591,20 +600,20 @@ module nn_layer_tb;
 
     task automatic report_coverage();
         section_begin("coverage (whole run)");
-        cover_bin("Y > 0",                             cov_y_pos);
-        cover_bin("Y clamped to 0 by ReLU",            cov_y_clamped);
-        cover_bin("X.W + B exactly 0",                 cov_y_zero_exact);
-        cover_bin("dot product > 0",                   cov_dot_pos);
-        cover_bin("dot product < 0",                   cov_dot_neg);
-        cover_bin("bias > 0",                          cov_bias_pos);
-        cover_bin("bias < 0",                          cov_bias_neg);
-        cover_bin("bias = 0",                          cov_bias_zero);
-        cover_bin("INT32 wrap (documented edge)",      cov_wrap);
-        cover_bin("input gap cycles",                  cov_gap);
-        cover_bin("backpressure cycles",               cov_backpressure);
-        cover_bin("reset during LOAD",                 cov_reset_load);
-        cover_bin("reset during COMPUTE",              cov_reset_compute);
-        cover_bin("reset during WRITEBACK",            cov_reset_writeback);
+        cover_bin("Y > 0",                             cov_y_pos,        1'b1);
+        cover_bin("Y clamped to 0 by ReLU",            cov_y_clamped,    APPLY_RELU);
+        cover_bin("X.W + B exactly 0",                 cov_y_zero_exact, 1'b1);
+        cover_bin("dot product > 0",                   cov_dot_pos, 1'b1);
+        cover_bin("dot product < 0",                   cov_dot_neg, 1'b1);
+        cover_bin("bias > 0",                          cov_bias_pos, 1'b1);
+        cover_bin("bias < 0",                          cov_bias_neg, 1'b1);
+        cover_bin("bias = 0",                          cov_bias_zero, 1'b1);
+        cover_bin("INT32 wrap (documented edge)",      cov_wrap, 1'b1);
+        cover_bin("input gap cycles",                  cov_gap, 1'b1);
+        cover_bin("backpressure cycles",               cov_backpressure, 1'b1);
+        cover_bin("reset during LOAD",                 cov_reset_load, 1'b1);
+        cover_bin("reset during COMPUTE",              cov_reset_compute, 1'b1);
+        cover_bin("reset during WRITEBACK",            cov_reset_writeback, 1'b1);
     endtask
 
     // -------------------------------------------------------------------------
@@ -620,15 +629,15 @@ module nn_layer_tb;
             results_fd = $fopen(resultsfile, "w");
             if (results_fd == 0) $fatal(1, "nn_layer_tb: cannot open %s", resultsfile);
             $fwrite(results_fd, "# nn_layer_tb: X, W, B and the Y streamed out of the DUT, per inference\n");
-            $fwrite(results_fd, "dims %0d %0d\n", INPUT_SIZE, OUTPUT_SIZE);
+            $fwrite(results_fd, "dims %0d %0d %0d\n", INPUT_SIZE, OUTPUT_SIZE, APPLY_RELU);
         end
         if ($value$plusargs("dumpfile=%s", dumpfile)) begin
             $dumpfile(dumpfile);
             $dumpvars(0, nn_layer_tb);
         end
 
-        $display("nn_layer_tb: Y = ReLU(X*W + B), %0d inputs -> %0d outputs, %0d cycles per inference without stalls",
-                 INPUT_SIZE, OUTPUT_SIZE, BUSY_CYCLES);
+        $display("nn_layer_tb: Y = %sX*W + B%s, %0d inputs -> %0d outputs, %0d cycles per inference without stalls",
+                 APPLY_RELU ? "ReLU(" : "", APPLY_RELU ? ")" : "", INPUT_SIZE, OUTPUT_SIZE, BUSY_CYCLES);
 
         rst       = 1'b1;
         s_valid   = 1'b0;
