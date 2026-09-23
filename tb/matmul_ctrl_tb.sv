@@ -36,15 +36,20 @@ module matmul_ctrl_tb;
     // -------------------------------------------------------------------------
     parameter int M      = 8;
     parameter int K      = 8;
-    parameter int N      = 8;
-    parameter int N_JOBS = 40;
+    parameter int N        = 8;
+    parameter int NUM_MACS = 1;
+    parameter int N_JOBS   = 40;
 
     localparam int LOAD_BEATS  = M*K + K*N;
-    localparam int BUSY_CYCLES = LOAD_BEATS + M*N*(K + 1) + 1;   // per job, no stalls
+    localparam int GROUPS      = (N + NUM_MACS - 1) / NUM_MACS;
+    // per job, no stalls: load, then one group every K cycles plus one output
+    // beat per column, then DONE
+    localparam int BUSY_CYCLES = LOAD_BEATS + M*GROUPS*K + M*N + 1;
     localparam int LW = $clog2(LOAD_BEATS);
     localparam int IW = (M > 1) ? $clog2(M) : 1;
     localparam int JW = (N > 1) ? $clog2(N) : 1;
     localparam int KW = (K > 1) ? $clog2(K) : 1;
+    localparam int PW = (NUM_MACS > 1) ? $clog2(NUM_MACS) : 1;
     localparam int MAX_ERRORS = 10;
 
     // -------------------------------------------------------------------------
@@ -64,13 +69,15 @@ module matmul_ctrl_tb;
     logic          mac_en;
     logic          mac_clear;
     logic [IW-1:0] i;
-    logic [JW-1:0] j;
+    logic [JW-1:0] j_base;
     logic [KW-1:0] k;
+    logic [PW-1:0] wb_sel;
 
     matmul_ctrl #(
-        .M (M),
-        .K (K),
-        .N (N)
+        .M        (M),
+        .K        (K),
+        .N        (N),
+        .NUM_MACS (NUM_MACS)
     ) dut (
         .clk       (clk),
         .rst       (rst),
@@ -86,8 +93,9 @@ module matmul_ctrl_tb;
         .mac_en    (mac_en),
         .mac_clear (mac_clear),
         .i         (i),
-        .j         (j),
-        .k         (k)
+        .j_base    (j_base),
+        .k         (k),
+        .wb_sel    (wb_sel)
     );
 
     always #5 clk = ~clk;
@@ -96,7 +104,19 @@ module matmul_ctrl_tb;
     // Reference model (the documented transition table) and bookkeeping
     // -------------------------------------------------------------------------
     matmul_state_t exp_state = S_IDLE;
-    int            exp_ld = 0, exp_i = 0, exp_j = 0, exp_k = 0;
+    int            exp_ld = 0, exp_i = 0, exp_jbase = 0, exp_k = 0, exp_wb = 0;
+
+    // Last valid MAC in the current group (the tail group can be short), and
+    // the column it streams out
+    function automatic int wb_last_exp();
+        int remaining;
+        remaining = N - exp_jbase;
+        return ((remaining < NUM_MACS) ? remaining : NUM_MACS) - 1;
+    endfunction
+
+    function automatic int exp_col();
+        return exp_jbase + exp_wb;
+    endfunction
 
     int unsigned n_checks = 0, n_errors = 0, n_jobs = 0, n_cycles = 0;
     int unsigned sec_checks = 0, sec_errors = 0, sec_jobs = 0;
@@ -108,6 +128,7 @@ module matmul_ctrl_tb;
 
     int unsigned trans [5][5];         // transition counts [from][to]
     int unsigned reset_from [5];       // resets applied in each state
+    int unsigned cov_group_stream = 0; // extra columns streamed from one group
 
     // -------------------------------------------------------------------------
     // Helpers
@@ -155,7 +176,7 @@ module matmul_ctrl_tb;
         expect_bit("mac_en",    mac_en,    exp_state == S_COMPUTE);
         expect_bit("mac_clear", mac_clear, exp_state == S_COMPUTE && exp_k == 0);
         expect_bit("m_valid",   m_valid,   exp_state == S_WRITEBACK);
-        expect_bit("m_last",    m_last,    exp_state == S_WRITEBACK && exp_i == M-1 && exp_j == N-1);
+        expect_bit("m_last",    m_last,    exp_state == S_WRITEBACK && exp_i == M-1 && exp_col() == N-1);
         expect_bit("busy",      busy,      exp_state != S_IDLE);
         expect_bit("done",      done,      exp_state == S_DONE);
     endtask
@@ -180,7 +201,7 @@ module matmul_ctrl_tb;
     task automatic model_advance(input bit sv, input bit mr);
         case (exp_state)
             S_IDLE: begin
-                exp_ld = 0; exp_i = 0; exp_j = 0; exp_k = 0;
+                exp_ld = 0; exp_i = 0; exp_jbase = 0; exp_k = 0; exp_wb = 0;
                 if (sv) exp_state = S_LOAD;
             end
             S_LOAD:
@@ -197,16 +218,20 @@ module matmul_ctrl_tb;
                 end
             S_WRITEBACK:
                 if (mr) begin
-                    if (exp_i == M - 1 && exp_j == N - 1) begin
+                    if (exp_i == M - 1 && exp_col() == N - 1) begin
                         exp_state = S_DONE;
-                    end else begin
+                    end else if (exp_wb == wb_last_exp()) begin   // group finished
+                        exp_wb    = 0;
                         exp_state = S_COMPUTE;
-                        if (exp_j == N - 1) begin
-                            exp_j = 0;
+                        if (exp_jbase + NUM_MACS >= N) begin
+                            exp_jbase = 0;
                             exp_i++;
                         end else begin
-                            exp_j++;
+                            exp_jbase += NUM_MACS;
                         end
+                    end else begin                                // next column of the group
+                        cov_group_stream++;
+                        exp_wb++;
                     end
                 end
             default: exp_state = S_IDLE;   // S_DONE
@@ -223,9 +248,10 @@ module matmul_ctrl_tb;
                     if (int'(ld_idx) != exp_ld)
                         error($sformatf("ld_idx %0d, expected %0d", ld_idx, exp_ld));
                 S_COMPUTE, S_WRITEBACK:
-                    if (int'(i) != exp_i || int'(j) != exp_j || int'(k) != exp_k)
-                        error($sformatf("(i,j,k) = (%0d,%0d,%0d), expected (%0d,%0d,%0d)",
-                                        i, j, k, exp_i, exp_j, exp_k));
+                    if (int'(i) != exp_i || int'(j_base) != exp_jbase || int'(k) != exp_k
+                        || int'(wb_sel) != exp_wb)
+                        error($sformatf("(i,j_base,k,wb_sel) = (%0d,%0d,%0d,%0d), expected (%0d,%0d,%0d,%0d)",
+                                        i, j_base, k, wb_sel, exp_i, exp_jbase, exp_k, exp_wb));
                 default: ;
             endcase
         end
@@ -257,7 +283,7 @@ module matmul_ctrl_tb;
         rst = 1'b0;
         n_cycles++;
         exp_state = S_IDLE;
-        exp_ld = 0; exp_i = 0; exp_j = 0; exp_k = 0;
+        exp_ld = 0; exp_i = 0; exp_jbase = 0; exp_k = 0; exp_wb = 0;
         job_busy  = 0;
         job_stall = 0;
         compare_model();
@@ -321,8 +347,8 @@ module matmul_ctrl_tb;
     task automatic end_test();
         $display("");
         if (n_errors == 0) begin
-            $display("TEST PASSED%s: matmul_ctrl_tb M=%0d K=%0d N=%0d seed=%0d | %0d jobs, %0d cycles, %0d checks, 0 errors, %0d busy cycles per job",
-                     run_note, M, K, N, seed, n_jobs, n_cycles, n_checks, BUSY_CYCLES);
+            $display("TEST PASSED%s: matmul_ctrl_tb M=%0d K=%0d N=%0d NUM_MACS=%0d seed=%0d | %0d jobs, %0d cycles, %0d checks, 0 errors, %0d busy cycles per job",
+                     run_note, M, K, N, NUM_MACS, seed, n_jobs, n_cycles, n_checks, BUSY_CYCLES);
             $finish;
         end else begin
             $display("TEST FAILED%s: matmul_ctrl_tb M=%0d K=%0d N=%0d seed=%0d | %0d errors in %0d checks",
@@ -400,6 +426,7 @@ module matmul_ctrl_tb;
         cover_bin("reset in COMPUTE",       reset_from[S_COMPUTE],           1'b1);
         cover_bin("reset in WRITEBACK",     reset_from[S_WRITEBACK],         1'b1);
         cover_bin("reset in DONE",          reset_from[S_DONE],              1'b1);
+        cover_bin("extra columns streamed from a group", cov_group_stream, NUM_MACS > 1 && N > 1);
     endtask
 
     // -------------------------------------------------------------------------
@@ -417,8 +444,8 @@ module matmul_ctrl_tb;
             $dumpvars(0, matmul_ctrl_tb);
         end
 
-        $display("matmul_ctrl_tb: M=%0d K=%0d N=%0d, %0d load beats, %0d busy cycles per job without stalls",
-                 M, K, N, LOAD_BEATS, BUSY_CYCLES);
+        $display("matmul_ctrl_tb: M=%0d K=%0d N=%0d NUM_MACS=%0d, %0d load beats, %0d busy cycles per job without stalls",
+                 M, K, N, NUM_MACS, LOAD_BEATS, BUSY_CYCLES);
 
         rst     = 1'b1;
         s_valid = 1'b0;

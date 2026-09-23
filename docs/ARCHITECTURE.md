@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the hardware as built so far. It will grow as later
-phases add parallel MACs and pipelining.
+phases add pipelining.
 
 ## Blocks
 
@@ -9,7 +9,7 @@ phases add parallel MACs and pipelining.
 |----------------|-----------------------|-------------------------------------------------------------|
 | MAC            | `rtl/mac.sv`          | Signed INT8 × INT8 → INT32 multiply-accumulate, 1 per clock |
 | ReLU           | `rtl/relu.sv`         | `y = x < 0 ? 0 : x` on INT32, combinational                 |
-| Matrix multiply| `rtl/matrix_mult.sv`  | Streaming C = A × B datapath: operand memory + one MAC      |
+| Matrix multiply| `rtl/matrix_mult.sv`  | Streaming C = A × B datapath: operand memory + NUM_MACS MACs|
 | Controller     | `rtl/matmul_ctrl.sv`  | FSM that sequences a matrix-multiply job                    |
 | Layer          | `rtl/nn_layer.sv`     | `Y = ReLU(X · W + B)`: the multiplier plus bias and ReLU    |
 | Requantizer    | `rtl/requant.sv`      | INT32 activation → INT8: shift, then saturate               |
@@ -26,23 +26,24 @@ signed INT32. The default is M = K = N = 8, and all three are parameters.
  s_valid, s_ready <-->|          matmul_ctrl           |<--> m_valid, m_ready, m_last
                       | IDLE LOAD COMPUTE WRITEBACK .. |---> busy, done
                       +--------------------------------+
-                        | ld_en      | i, j, k    | mac_en, mac_clear
-                        v ld_idx     v            v
- s_data --------->[ operand memory ]-- A[i][k] -->[     ]
- (INT8)           [ A, then B:     ]              [ mac ]--- acc ---> m_data (INT32)
-                  [ M*K + K*N B    ]-- B[k][j] -->[     ]
+                        | ld_en   | i, j_base, k, wb_sel | mac_en, mac_clear
+                        v ld_idx   v                      v
+ s_data --------->[ operand memory ]-- A[i][k] ------> broadcast to every MAC
+ (INT8)           [ A, then B:     ]-- B[k][j_base+p] -> MAC p
+                  [ M*K + K*N B    ]   NUM_MACS accumulators --mux--> m_data
 ```
 
 - **Operand memory.** A and B are stored back to back in one memory,
   M·K + K·N bytes (128 for 8×8×8). It has one write port, used while
   loading, and two read ports: A[i][k] at address `i*K + k`, and B[k][j] at
   address `M*K + k*N + j`.
-- **One MAC.** Each element of C is a K-term dot product, computed in K
+- **MACs.** Each element of C is a K-term dot product, computed in K
   consecutive cycles. The first term uses the MAC's clear+en load, so a new
-  sum starts without an idle cycle.
-- **No C buffer.** The MAC's accumulator register is the output data
-  register. While an element waits to be accepted, the MAC is idle, and its
-  accumulator holds the value steady. (Phase 3's first version kept a
+  sum starts without an idle cycle. With `NUM_MACS > 1`, that many output
+  columns are computed at once; see *Parallel MACs* below.
+- **No C buffer.** The MACs' accumulator registers are the output data
+  registers. While an element waits to be accepted, the MACs are idle, and
+  their accumulators hold their values steady. (Phase 3's first version kept a
   2,048-bit C register file; the streaming design does not need it.)
 - **Reset.** Only control state is reset. The operand memory is data and is
   always written before it is read.
@@ -93,7 +94,8 @@ signed INT32. The default is M = K = N = 8, and all three are parameters.
 | IDLE      | `s_valid`                                     | LOAD      | all cleared |
 | LOAD      | a beat is accepted and it was the last of M·K + K·N | COMPUTE | `ld_idx` + 1 per accepted beat |
 | COMPUTE   | `k == K-1` (after K cycles)                   | WRITEBACK | `k` + 1, wrapping to 0 |
-| WRITEBACK | `m_ready`, and more elements remain           | COMPUTE   | next (i, j), row-major |
+| WRITEBACK | `m_ready`, and the group has more columns     | WRITEBACK | `wb_sel` + 1 |
+| WRITEBACK | `m_ready`, group finished, more elements left | COMPUTE   | next group (`j_base` + NUM_MACS), then next row |
 | WRITEBACK | `m_ready`, and this was the last element      | DONE      | |
 | DONE      | always (one cycle)                            | IDLE      | |
 
@@ -111,7 +113,7 @@ All outputs are decoded from the registered state and counters:
 | `mac_en`    | COMPUTE                                |
 | `mac_clear` | COMPUTE and `k == 0` (first term)      |
 | `m_valid`   | WRITEBACK                              |
-| `m_last`    | WRITEBACK and (i, j) = (M-1, N-1)      |
+| `m_last`    | WRITEBACK and the element is C[M-1][N-1] |
 | `busy`      | not IDLE                               |
 | `done`      | DONE                                   |
 
@@ -138,6 +140,8 @@ The end of the job: C[7][7] is computed in cycles 696–703. Its write-back
 beat is cycle 704, and DONE is cycle 705. In cycle 706 the next job's IDLE
 cycle can start.
 
+With `NUM_MACS = 1`:
+
 | Phase                       | Cycles (general)              | 8×8×8 |
 |-----------------------------|-------------------------------|-------|
 | IDLE, seeing `s_valid`      | 1                             | 1     |
@@ -145,6 +149,10 @@ cycle can start.
 | COMPUTE + WRITEBACK         | M·N·(K + 1)                   | 576   |
 | DONE                        | 1                             | 1     |
 | **Job, back to back**       | **M·K + K·N + M·N·(K+1) + 2** | **706** |
+
+The general form, for any `NUM_MACS`, is
+`M·K + K·N + M·ceil(N/NUM_MACS)·K + M·N + 2`; at eight MACs an 8×8×8 job is
+258 cycles.
 
 - **Busy time.** `busy` is high for all but the IDLE cycle: 705 cycles for
   8×8×8.
@@ -279,3 +287,56 @@ Measured: 1,724 busy cycles and 1,725 between back-to-back inferences at
 16 → 32 → 10, and 48 at 4 → 3 → 2, both matching the formula. Of those 1,725
 cycles, 848 are spent loading weights and 874 computing, which is what Phases
 7 and 8 will attack.
+
+## Parallel MACs
+
+`NUM_MACS` sets how many output columns are computed at once. Every MAC sees
+the same activation `A[i][k]`; MAC *p* reads its own weight `B[k][j_base + p]`
+and keeps its own accumulator.
+
+```
+                      A[i][k]  (broadcast)
+                         |
+        +----------------+----------------+
+        v                v                v
+   [ mac 0 ]        [ mac 1 ]   ...  [ mac P-1 ]
+   B[k][j]          B[k][j+1]        B[k][j+P-1]
+        |                |                |
+        +--------- mux (wb_sel) ----------+---> m_data, one column per cycle
+```
+
+- A group of `NUM_MACS` columns takes K cycles whatever its width, then
+  streams out one column per cycle.
+- When N is not a multiple of `NUM_MACS`, the last group is short. The spare
+  MACs repeat the last column so their addresses stay in range, and their
+  results are never streamed out.
+- `NUM_MACS = 1` is the original single-MAC schedule.
+
+```
+compute + write-back cycles = M · ceil(N / NUM_MACS) · K + M · N
+```
+
+The first term falls with `NUM_MACS`; the second, one beat per output element,
+does not. Nor does weight loading, which is one byte per cycle.
+
+### Measured cycles
+
+`make parallel` runs the 16-32-10 network at each width and prints this table.
+These are simulated cycle counts. No clock frequency is implied, and nothing
+here is an FPGA measurement.
+
+| NUM_MACS | Network cycles/inference | Speedup | Layer 16→32 cycles | Layer compute only |
+|----------|--------------------------|---------|--------------------|--------------------|
+| 1        | 1,725                    | 1.00×   | 1,074              | 544                |
+| 4        | 1,117                    | 1.54×   | 690                | 160                |
+| 8        | 1,021                    | 1.69×   | 626                | 96                 |
+| 16       | 957                      | 1.80×   | 594                | 64                 |
+| 32       | 941                      | 1.83×   | 578                | 48                 |
+
+The compute phase scales close to linearly: the 16→32 layer's compute falls
+from 544 cycles to 48, which is 11.3× with 32 MACs. The end-to-end figure does
+not, because weight loading is unchanged. For the network, 848 of the 1,725
+cycles at `NUM_MACS = 1` are weight beats, and at 32 MACs those 848 cycles are
+90% of the remaining 941. This is Amdahl's law with concrete numbers: past
+about 8 MACs, more multipliers buy very little, and the thing to fix is the
+one-byte-per-cycle weight port or reusing weights across inferences.

@@ -41,9 +41,13 @@
 // bias within +-2,147,221,503. The testbench checks both sides of that edge.
 // ReLU is applied after the bias, so Y is never negative.
 //
-// Cycles per inference, back to back and without stalls (see matmul_ctrl.sv):
-//   INPUT_SIZE + INPUT_SIZE*OUTPUT_SIZE + OUTPUT_SIZE*(INPUT_SIZE+1) + 2
-//   = 282 for 16 inputs and 8 outputs.
+// NUM_MACS output channels are computed in parallel (see matmul_ctrl.sv).
+// Cycles per inference, back to back and without stalls:
+//   INPUT_SIZE*(1 + OUTPUT_SIZE)                       load X and W
+//   + ceil(OUTPUT_SIZE/NUM_MACS)*INPUT_SIZE            compute
+//   + OUTPUT_SIZE                                      output beats
+//   + 2                                                IDLE and DONE
+//   = 282 for 16 inputs, 8 outputs and one MAC.
 // =============================================================================
 
 `timescale 1ns / 1ps
@@ -54,7 +58,8 @@ module nn_layer #(
     parameter int OUTPUT_SIZE = 8,    // columns of W, length of Y
     parameter int DATA_WIDTH  = 8,    // signed activation / weight width
     parameter int ACC_WIDTH   = 32,   // signed accumulator / bias / output width
-    parameter bit APPLY_RELU  = 1'b1  // 0 for an output layer (raw logits)
+    parameter bit APPLY_RELU  = 1'b1, // 0 for an output layer (raw logits)
+    parameter int NUM_MACS    = 1     // output channels computed in parallel
 ) (
     input  logic                             clk,
     input  logic                             rst,      // synchronous, active-high
@@ -88,7 +93,8 @@ module nn_layer #(
         .K          (INPUT_SIZE),
         .N          (OUTPUT_SIZE),
         .DATA_WIDTH (DATA_WIDTH),
-        .ACC_WIDTH  (ACC_WIDTH)
+        .ACC_WIDTH  (ACC_WIDTH),
+        .NUM_MACS   (NUM_MACS)
     ) u_matmul (
         .clk     (clk),
         .rst     (rst),

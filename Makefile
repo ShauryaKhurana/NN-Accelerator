@@ -33,6 +33,7 @@
 #   make net-params    network at 4-3-2, and with SHIFT=0, + NumPy check
 #   make net-iverilog  all network configurations on Icarus Verilog
 #   make net-waves     short network run that writes waveforms/nn_accelerator_tb.vcd
+#   make parallel      measure cycles per inference for NUM_MACS = 1,4,8,16,32
 #   make golden        self-test of the NumPy golden model (python/golden_model.py)
 #   make venv          create .venv with the Python dependencies (numpy)
 #   make check-tools   report which simulators / tools are installed
@@ -107,7 +108,7 @@ define iverilog_run
 	@grep -q '^TEST PASSED' $(SIM_DIR)/$(3).iverilog.log
 endef
 
-.PHONY: help check-tools lint test test-iverilog clean venv golden \
+.PHONY: help check-tools lint test test-iverilog clean venv golden parallel \
         mac mac-params mac-iverilog mac-waves \
         relu relu-params relu-iverilog relu-waves \
         ctrl ctrl-params ctrl-iverilog ctrl-waves \
@@ -171,6 +172,8 @@ ctrl:
 ctrl-params:
 	$(call verilator_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb_1x1x1,-GM=1 -GK=1 -GN=1 -GN_JOBS=400)
 	$(call verilator_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb_2x3x2,-GM=2 -GK=3 -GN=2 -GN_JOBS=400)
+	$(call verilator_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb_p4,-GNUM_MACS=4)
+	$(call verilator_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb_3x16x5_p4,-GM=3 -GK=16 -GN=5 -GNUM_MACS=4 -GN_JOBS=200)
 
 ctrl-iverilog:
 	$(call iverilog_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb,)
@@ -196,6 +199,8 @@ matmul:
 matmul-params:
 	$(call matmul_run,verilator_run,matrix_mult_tb_3x16x5,-GM=3 -GK=16 -GN=5,verilator)
 	$(call matmul_run,verilator_run,matrix_mult_tb_1x16x8,-GM=1 -GK=16 -GN=8,verilator)
+	$(call matmul_run,verilator_run,matrix_mult_tb_p4,-GNUM_MACS=4,verilator)
+	$(call matmul_run,verilator_run,matrix_mult_tb_3x16x5_p4,-GM=3 -GK=16 -GN=5 -GNUM_MACS=4,verilator)
 
 matmul-iverilog:
 	$(call matmul_run,iverilog_run,matrix_mult_tb,,iverilog)
@@ -220,6 +225,7 @@ layer-params:
 	$(call layer_run,verilator_run,nn_layer_tb_4x3,-GINPUT_SIZE=4 -GOUTPUT_SIZE=3,verilator)
 	$(call layer_run,verilator_run,nn_layer_tb_32x10,-GINPUT_SIZE=32 -GOUTPUT_SIZE=10,verilator)
 	$(call layer_run,verilator_run,nn_layer_tb_norelu,-GAPPLY_RELU=0,verilator)
+	$(call layer_run,verilator_run,nn_layer_tb_p8,-GOUTPUT_SIZE=32 -GNUM_MACS=8,verilator)
 
 layer-iverilog:
 	$(call layer_run,iverilog_run,nn_layer_tb,,iverilog)
@@ -251,11 +257,14 @@ net:
 net-params:
 	$(call net_run,verilator_run,nn_accelerator_tb_4x3x2,-GINPUT_SIZE=4 -GHIDDEN_SIZE=3 -GOUTPUT_SIZE=2,verilator)
 	$(call net_run,verilator_run,nn_accelerator_tb_shift0,-GSHIFT=0,verilator)
+	$(call net_run,verilator_run,nn_accelerator_tb_p8,-GNUM_MACS=8,verilator)
+	$(call net_run,verilator_run,nn_accelerator_tb_4x3x2_p4,-GINPUT_SIZE=4 -GHIDDEN_SIZE=3 -GOUTPUT_SIZE=2 -GNUM_MACS=4,verilator)
 
 net-iverilog:
 	$(call net_run,iverilog_run,nn_accelerator_tb,,iverilog)
 	$(call net_run,iverilog_run,nn_accelerator_tb_4x3x2,-Pnn_accelerator_tb.INPUT_SIZE=4 -Pnn_accelerator_tb.HIDDEN_SIZE=3 -Pnn_accelerator_tb.OUTPUT_SIZE=2,iverilog)
 	$(call net_run,iverilog_run,nn_accelerator_tb_shift0,-Pnn_accelerator_tb.SHIFT=0,iverilog)
+	$(call net_run,iverilog_run,nn_accelerator_tb_p8,-Pnn_accelerator_tb.NUM_MACS=8,iverilog)
 
 net-waves:
 	$(call verilator_run,nn_accelerator_tb,$(NET_RTL) tb/nn_accelerator_tb.sv,nn_accelerator_tb,,+dumpfile=$(WAVE_DIR)/nn_accelerator_tb.vcd)
@@ -264,6 +273,26 @@ net-waves:
 layer-waves:
 	$(call verilator_run,nn_layer_tb,$(LAYER_RTL) tb/nn_layer_tb.sv,nn_layer_tb,,+dumpfile=$(WAVE_DIR)/nn_layer_tb.vcd)
 	@echo "wrote $(WAVE_DIR)/nn_layer_tb.vcd -- open it with: surfer $(WAVE_DIR)/nn_layer_tb.vcd"
+
+# Phase 7 measurement: cycles per inference of the 16-32-10 network for each
+# MAC count. Results come from the testbench's own cycle accounting, which is
+# checked against the documented formula on every run.
+parallel:
+	@rm -f $(SIM_DIR)/parallel.txt
+	@for p in 1 4 8 16 32; do \
+	    mkdir -p $(SIM_DIR)/verilator/net_p$$p; \
+	    $(VERILATOR) $(VERILATOR_FLAGS) -GNUM_MACS=$$p --top-module nn_accelerator_tb \
+	        --Mdir $(SIM_DIR)/verilator/net_p$$p $(NET_RTL) tb/nn_accelerator_tb.sv || exit 1; \
+	    $(SIM_DIR)/verilator/net_p$$p/Vnn_accelerator_tb $(VERILATOR_RUN) +seed=$(SEED) \
+	        > $(SIM_DIR)/parallel_p$$p.log || exit 1; \
+	    grep -q '^TEST PASSED' $(SIM_DIR)/parallel_p$$p.log || exit 1; \
+	    c=$$(sed -n 's/^TEST PASSED.*0 errors, \([0-9]*\) cycles per inference back to back.*/\1/p' \
+	          $(SIM_DIR)/parallel_p$$p.log); \
+	    echo "$$p $$c" >> $(SIM_DIR)/parallel.txt; \
+	done
+	@echo ""
+	@echo "16-32-10 network, cycles per inference (simulated; no frequency implied)"
+	@awk 'NR==1 {base=$$2} {printf "  %3d MACs  %6d cycles  %5.2fx\n", $$1, $$2, base/$$2}' $(SIM_DIR)/parallel.txt
 
 golden:
 	$(PYTHON) python/golden_model.py

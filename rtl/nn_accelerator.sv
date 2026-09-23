@@ -39,11 +39,13 @@
 // Cycles per inference, no stalls (16 -> 32 -> 10 in brackets):
 //   1                              IDLE, seeing the first beat
 //   + INPUT_SIZE*(1 + HIDDEN_SIZE) layer 1 loads X and W1          [528]
-//   + HIDDEN_SIZE*(INPUT_SIZE+1)+1 layer 1 computes; the first
-//                                  activation waits one cycle
-//                                  for layer 2 to leave IDLE       [545]
+//   + ceil(HIDDEN/NUM_MACS)*INPUT_SIZE + HIDDEN_SIZE + 1
+//                                  layer 1 computes and streams;
+//                                  the first activation waits one
+//                                  cycle for layer 2 to leave IDLE [545]
 //   + HIDDEN_SIZE*OUTPUT_SIZE      layer 2 loads W2                [320]
-//   + OUTPUT_SIZE*(HIDDEN_SIZE+1)  layer 2 computes                [330]
+//   + ceil(OUTPUT/NUM_MACS)*HIDDEN_SIZE + OUTPUT_SIZE
+//                                  layer 2 computes and streams    [330]
 //   + 1                            DONE                            [1]
 // =============================================================================
 
@@ -56,7 +58,8 @@ module nn_accelerator #(
     parameter int OUTPUT_SIZE = 10,
     parameter int DATA_WIDTH  = 8,    // signed activation / weight width
     parameter int ACC_WIDTH   = 32,   // signed accumulator / bias / logit width
-    parameter int SHIFT       = 8     // requantization shift between the layers
+    parameter int SHIFT       = 8,    // requantization shift between the layers
+    parameter int NUM_MACS    = 1     // output channels computed in parallel, per layer
 ) (
     input  logic                             clk,
     input  logic                             rst,      // synchronous, active-high
@@ -130,7 +133,8 @@ module nn_accelerator #(
         .OUTPUT_SIZE (HIDDEN_SIZE),
         .DATA_WIDTH  (DATA_WIDTH),
         .ACC_WIDTH   (ACC_WIDTH),
-        .APPLY_RELU  (1'b1)
+        .APPLY_RELU  (1'b1),
+        .NUM_MACS    (NUM_MACS)
     ) u_layer1 (
         .clk       (clk),
         .rst       (rst),
@@ -166,7 +170,8 @@ module nn_accelerator #(
         .OUTPUT_SIZE (OUTPUT_SIZE),
         .DATA_WIDTH  (DATA_WIDTH),
         .ACC_WIDTH   (ACC_WIDTH),
-        .APPLY_RELU  (1'b0)
+        .APPLY_RELU  (1'b0),
+        .NUM_MACS    (NUM_MACS)
     ) u_layer2 (
         .clk       (clk),
         .rst       (rst),

@@ -46,6 +46,7 @@ module nn_accelerator_tb;
     parameter int HIDDEN_SIZE = 32;
     parameter int OUTPUT_SIZE = 10;
     parameter int SHIFT       = 8;
+    parameter int NUM_MACS    = 1;
     parameter int N_RANDOM    = 100;
 
     localparam int DATA_WIDTH = 8;
@@ -56,10 +57,12 @@ module nn_accelerator_tb;
     localparam int L1_BEATS   = INPUT_SIZE + INPUT_SIZE*HIDDEN_SIZE;
     localparam int W2_BEATS   = HIDDEN_SIZE*OUTPUT_SIZE;
     localparam int HOST_BEATS = L1_BEATS + W2_BEATS;
+    localparam int GROUPS1 = (HIDDEN_SIZE + NUM_MACS - 1) / NUM_MACS;
+    localparam int GROUPS2 = (OUTPUT_SIZE + NUM_MACS - 1) / NUM_MACS;
     // Layer 1 loads and computes; the first activation waits one cycle for
     // layer 2 to leave IDLE; then W2 loads, layer 2 computes, and DONE.
-    localparam int BUSY_CYCLES = L1_BEATS + HIDDEN_SIZE*(INPUT_SIZE + 1) + 1
-                                 + W2_BEATS + OUTPUT_SIZE*(HIDDEN_SIZE + 1) + 1;
+    localparam int BUSY_CYCLES = L1_BEATS + GROUPS1*INPUT_SIZE + HIDDEN_SIZE + 1
+                                 + W2_BEATS + GROUPS2*HIDDEN_SIZE + OUTPUT_SIZE + 1;
     localparam int PERIOD      = BUSY_CYCLES + 1;
 
     localparam longint ACC_MAX    = (longint'(1) << (ACC_WIDTH - 1)) - 1;
@@ -92,7 +95,8 @@ module nn_accelerator_tb;
         .OUTPUT_SIZE (OUTPUT_SIZE),
         .DATA_WIDTH  (DATA_WIDTH),
         .ACC_WIDTH   (ACC_WIDTH),
-        .SHIFT       (SHIFT)
+        .SHIFT       (SHIFT),
+        .NUM_MACS    (NUM_MACS)
     ) dut (
         .clk        (clk),
         .rst        (rst),
@@ -517,8 +521,8 @@ module nn_accelerator_tb;
         end
         $display("");
         if (n_errors == 0) begin
-            $display("TEST PASSED%s: nn_accelerator_tb %0d-%0d-%0d SHIFT=%0d seed=%0d | %0d inferences, %0d checks, 0 errors, %0d cycles per inference back to back",
-                     run_note, INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE, SHIFT, seed, n_jobs, n_checks, PERIOD);
+            $display("TEST PASSED%s: nn_accelerator_tb %0d-%0d-%0d SHIFT=%0d NUM_MACS=%0d seed=%0d | %0d inferences, %0d checks, 0 errors, %0d cycles per inference back to back",
+                     run_note, INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE, SHIFT, NUM_MACS, seed, n_jobs, n_checks, PERIOD);
             $finish;
         end else begin
             $display("TEST FAILED%s: nn_accelerator_tb %0d-%0d-%0d SHIFT=%0d seed=%0d | %0d errors in %0d checks",

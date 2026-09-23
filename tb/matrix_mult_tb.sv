@@ -47,6 +47,7 @@ module matrix_mult_tb;
     parameter int M        = 8;
     parameter int K        = 8;
     parameter int N        = 8;
+    parameter int NUM_MACS = 1;
     parameter int N_RANDOM = 200;
 
     localparam int DATA_WIDTH  = 8;
@@ -54,7 +55,10 @@ module matrix_mult_tb;
     localparam int CLK_PERIOD  = 10;
     localparam int MAX_ERRORS  = 10;
     localparam int LOAD_BEATS  = M*K + K*N;
-    localparam int BUSY_CYCLES = LOAD_BEATS + M*N*(K + 1) + 1;   // per job, no stalls
+    localparam int GROUPS      = (N + NUM_MACS - 1) / NUM_MACS;
+    // load, then per row: one group of NUM_MACS columns every K cycles, then
+    // one output beat per column; plus DONE
+    localparam int BUSY_CYCLES = LOAD_BEATS + M*GROUPS*K + M*N + 1;
     localparam int PERIOD      = BUSY_CYCLES + 1;                // plus the IDLE cycle
 
     // -------------------------------------------------------------------------
@@ -77,7 +81,8 @@ module matrix_mult_tb;
         .K          (K),
         .N          (N),
         .DATA_WIDTH (DATA_WIDTH),
-        .ACC_WIDTH  (ACC_WIDTH)
+        .ACC_WIDTH  (ACC_WIDTH),
+        .NUM_MACS   (NUM_MACS)
     ) dut (
         .clk     (clk),
         .rst     (rst),
@@ -414,12 +419,12 @@ module matrix_mult_tb;
         end
         $display("");
         if (n_errors == 0) begin
-            $display("TEST PASSED%s: matrix_mult_tb M=%0d K=%0d N=%0d seed=%0d | %0d jobs, %0d checks, 0 errors, %0d cycles per job back to back",
-                     run_note, M, K, N, seed, n_jobs, n_checks, PERIOD);
+            $display("TEST PASSED%s: matrix_mult_tb M=%0d K=%0d N=%0d NUM_MACS=%0d seed=%0d | %0d jobs, %0d checks, 0 errors, %0d cycles per job back to back",
+                     run_note, M, K, N, NUM_MACS, seed, n_jobs, n_checks, PERIOD);
             $finish;
         end else begin
-            $display("TEST FAILED%s: matrix_mult_tb M=%0d K=%0d N=%0d seed=%0d | %0d errors in %0d checks",
-                     run_note, M, K, N, seed, n_errors, n_checks);
+            $display("TEST FAILED%s: matrix_mult_tb M=%0d K=%0d N=%0d NUM_MACS=%0d seed=%0d | %0d errors in %0d checks",
+                     run_note, M, K, N, NUM_MACS, seed, n_errors, n_checks);
             $fatal(1, "matrix_mult_tb failed");
         end
     endtask
