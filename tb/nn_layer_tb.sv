@@ -45,6 +45,7 @@ module nn_layer_tb;
     parameter int INPUT_SIZE  = 16;
     parameter int OUTPUT_SIZE = 8;
     parameter bit APPLY_RELU  = 1'b1;   // 0 exercises an output layer (raw logits)
+    parameter int NUM_MACS    = 1;
     parameter int N_RANDOM    = 200;
 
     localparam int DATA_WIDTH  = 8;
@@ -52,7 +53,8 @@ module nn_layer_tb;
     localparam int CLK_PERIOD  = 10;
     localparam int MAX_ERRORS  = 10;
     localparam int LOAD_BEATS  = INPUT_SIZE + INPUT_SIZE*OUTPUT_SIZE;
-    localparam int BUSY_CYCLES = LOAD_BEATS + OUTPUT_SIZE*(INPUT_SIZE + 1) + 1;
+    localparam int GROUPS      = (OUTPUT_SIZE + NUM_MACS - 1) / NUM_MACS;
+    localparam int BUSY_CYCLES = LOAD_BEATS + GROUPS*INPUT_SIZE + OUTPUT_SIZE + 1;
     localparam int PERIOD      = BUSY_CYCLES + 1;
 
     localparam longint ACC_MAX   = (longint'(1) << (ACC_WIDTH - 1)) - 1;
@@ -81,7 +83,8 @@ module nn_layer_tb;
         .OUTPUT_SIZE (OUTPUT_SIZE),
         .DATA_WIDTH  (DATA_WIDTH),
         .ACC_WIDTH   (ACC_WIDTH),
-        .APPLY_RELU  (APPLY_RELU)
+        .APPLY_RELU  (APPLY_RELU),
+        .NUM_MACS    (NUM_MACS)
     ) dut (
         .clk       (clk),
         .rst       (rst),
@@ -452,8 +455,8 @@ module nn_layer_tb;
         end
         $display("");
         if (n_errors == 0) begin
-            $display("TEST PASSED%s: nn_layer_tb INPUT_SIZE=%0d OUTPUT_SIZE=%0d APPLY_RELU=%0d seed=%0d | %0d inferences, %0d checks, 0 errors, %0d cycles per inference back to back",
-                     run_note, INPUT_SIZE, OUTPUT_SIZE, APPLY_RELU, seed, n_jobs, n_checks, PERIOD);
+            $display("TEST PASSED%s: nn_layer_tb INPUT_SIZE=%0d OUTPUT_SIZE=%0d APPLY_RELU=%0d NUM_MACS=%0d seed=%0d | %0d inferences, %0d checks, 0 errors, %0d cycles per inference back to back",
+                     run_note, INPUT_SIZE, OUTPUT_SIZE, APPLY_RELU, NUM_MACS, seed, n_jobs, n_checks, PERIOD);
             $finish;
         end else begin
             $display("TEST FAILED%s: nn_layer_tb INPUT_SIZE=%0d OUTPUT_SIZE=%0d APPLY_RELU=%0d seed=%0d | %0d errors in %0d checks",

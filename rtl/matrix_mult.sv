@@ -1,5 +1,5 @@
 // =============================================================================
-// matrix_mult.sv - streaming C = A x B on a single MAC (INT8 x INT8 -> INT32)
+// matrix_mult.sv - streaming C = A x B on NUM_MACS MACs (INT8 x INT8 -> INT32)
 // =============================================================================
 // Datapath of the matrix multiplier. The control FSM is rtl/matmul_ctrl.sv.
 //
@@ -7,11 +7,11 @@
 //   s_valid, s_ready <-->|          matmul_ctrl           |<--> m_valid, m_ready, m_last
 //                        | IDLE LOAD COMPUTE WRITEBACK .. |---> busy, done
 //                        +--------------------------------+
-//                          | ld_en      | i, j, k    | mac_en, mac_clear
-//                          v ld_idx     v            v
-//   s_data ---------->[ operand memory ]-- A[i][k] -->[     ]
-//   (INT8)            [ A, then B:     ]              [ mac ]--- acc ---> m_data (INT32)
-//                     [ M*K + K*N B    ]-- B[k][j] -->[     ]
+//                          | ld_en   | i, j_base, k, wb_sel | mac_en, mac_clear
+//                          v ld_idx   v                      v
+//   s_data ---------->[ operand memory ]-- A[i][k] ------> broadcast to every MAC
+//   (INT8)            [ A, then B:     ]-- B[k][j_base+p] -> MAC p
+//                     [ M*K + K*N B    ]   NUM_MACS accumulators --mux--> m_data
 //
 // Stream protocol (both directions): a beat transfers on a rising edge where
 // valid and ready are both high.
@@ -21,9 +21,15 @@
 //           m_last marks the final element. While m_valid is high and m_ready
 //           is low, m_data and m_last hold steady.
 //
-// C streams straight from the MAC's accumulator. In WRITEBACK the MAC is
-// idle and holds the finished sum, so no C buffer is needed.
-// Cycles per job (8x8x8, no stalls): 706; see matmul_ctrl.sv for the breakdown.
+// NUM_MACS MACs compute one group of output columns at a time: they all see
+// the same A[i][k], and MAC p reads B[k][j_base + p]. The group's results are
+// streamed out one per cycle, picked by wb_sel. NUM_MACS = 1 is a single MAC
+// and the original schedule.
+//
+// C streams straight from a MAC's accumulator. In WRITEBACK the MACs are idle
+// and hold their finished sums, so no C buffer is needed.
+// Cycles per job (8x8x8, no stalls): 706 with one MAC, 258 with eight; see
+// matmul_ctrl.sv for the breakdown.
 // The operand memory is data, not control, so it is not reset.
 // =============================================================================
 
@@ -35,7 +41,8 @@ module matrix_mult #(
     parameter int K          = 8,    // columns of A = rows of B (dot-product length)
     parameter int N          = 8,    // columns of B and C
     parameter int DATA_WIDTH = 8,    // signed operand width
-    parameter int ACC_WIDTH  = 32    // signed accumulator / result width
+    parameter int ACC_WIDTH  = 32,   // signed accumulator / result width
+    parameter int NUM_MACS   = 1     // output columns computed in parallel
 ) (
     input  logic                         clk,
     input  logic                         rst,       // synchronous, active-high
@@ -58,19 +65,22 @@ module matrix_mult #(
     localparam int IW = (M > 1) ? $clog2(M) : 1;
     localparam int JW = (N > 1) ? $clog2(N) : 1;
     localparam int KW = (K > 1) ? $clog2(K) : 1;
+    localparam int PW = (NUM_MACS > 1) ? $clog2(NUM_MACS) : 1;
 
     logic          ld_en;
     logic [LW-1:0] ld_idx;
     logic          mac_en;
     logic          mac_clear;
     logic [IW-1:0] i;
-    logic [JW-1:0] j;
+    logic [JW-1:0] j_base;
     logic [KW-1:0] k;
+    logic [PW-1:0] wb_sel;
 
     matmul_ctrl #(
-        .M (M),
-        .K (K),
-        .N (N)
+        .M        (M),
+        .K        (K),
+        .N        (N),
+        .NUM_MACS (NUM_MACS)
     ) u_ctrl (
         .clk       (clk),
         .rst       (rst),
@@ -86,8 +96,9 @@ module matrix_mult #(
         .mac_en    (mac_en),
         .mac_clear (mac_clear),
         .i         (i),
-        .j         (j),
-        .k         (k)
+        .j_base    (j_base),
+        .k         (k),
+        .wb_sel    (wb_sel)
     );
 
     // -------------------------------------------------------------------------
@@ -95,34 +106,46 @@ module matrix_mult #(
     // -------------------------------------------------------------------------
     logic signed [DATA_WIDTH-1:0] op_mem [LOAD_BEATS];
     logic        [LW-1:0]         a_addr;
-    logic        [LW-1:0]         b_addr;
     logic signed [DATA_WIDTH-1:0] mac_a;
-    logic signed [DATA_WIDTH-1:0] mac_b;
+    logic signed [ACC_WIDTH-1:0]  mac_acc [NUM_MACS];
 
     always_ff @(posedge clk) begin
         if (ld_en) op_mem[ld_idx] <= s_data;
     end
 
-    assign a_addr = LW'(i) * LW'(K) + LW'(k);                  // A[i][k]
-    assign b_addr = LW'(M*K) + LW'(k) * LW'(N) + LW'(j);       // B[k][j]
+    assign a_addr = LW'(i) * LW'(K) + LW'(k);                  // A[i][k], broadcast
     assign mac_a  = op_mem[a_addr];
-    assign mac_b  = op_mem[b_addr];
 
     // -------------------------------------------------------------------------
-    // MAC: its accumulator is the output data register
+    // One MAC per output column of the group. Their accumulators are the
+    // output data registers; wb_sel picks the one being streamed out.
     // -------------------------------------------------------------------------
-    mac #(
-        .DATA_WIDTH (DATA_WIDTH),
-        .ACC_WIDTH  (ACC_WIDTH)
-    ) u_mac (
-        .clk   (clk),
-        .rst   (rst),
-        .en    (mac_en),
-        .clear (mac_clear),
-        .a     (mac_a),
-        .b     (mac_b),
-        .acc   (m_data)
-    );
+    for (genvar p = 0; p < NUM_MACS; p++) begin : g_mac
+        logic [JW-1:0]                col;
+        logic [LW-1:0]                b_addr;
+        logic signed [DATA_WIDTH-1:0] mac_b;
+
+        // In a short tail group the spare MACs repeat the last column, so the
+        // address stays in range; their results are never streamed out.
+        assign col    = (int'(j_base) + p < N) ? JW'(int'(j_base) + p) : JW'(N - 1);
+        assign b_addr = LW'(M*K) + LW'(k) * LW'(N) + LW'(col);       // B[k][col]
+        assign mac_b  = op_mem[b_addr];
+
+        mac #(
+            .DATA_WIDTH (DATA_WIDTH),
+            .ACC_WIDTH  (ACC_WIDTH)
+        ) u_mac (
+            .clk   (clk),
+            .rst   (rst),
+            .en    (mac_en),
+            .clear (mac_clear),
+            .a     (mac_a),
+            .b     (mac_b),
+            .acc   (mac_acc[p])
+        );
+    end
+
+    assign m_data = mac_acc[wb_sel];
 
 endmodule
 

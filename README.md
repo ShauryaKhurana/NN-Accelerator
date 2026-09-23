@@ -17,7 +17,7 @@ next one starts.
 | 4     | Control FSM + handshaking      | done — verified on Verilator and Icarus, and against NumPy |
 | 5     | NN layer `ReLU(X·W + B)`       | done — verified on Verilator and Icarus, and against NumPy |
 | 6     | Two-layer network (16→32→10)   | done — verified on Verilator and Icarus, and against NumPy |
-| 7     | Parallel MAC array             | not started |
+| 7     | Parallel MAC array             | done — verified on Verilator and Icarus, and against NumPy |
 | 8     | Pipelining                     | not started |
 | 9     | Python-driven random regression| not started |
 | 10    | Waveform tooling               | not started |
@@ -60,6 +60,7 @@ Check what is installed with `make check-tools`.
 make test            # Verilator: RTL lint + all testbenches (primary)
 make test-iverilog   # Icarus Verilog: the same testbenches (cross-check)
 make mac SEED=1234   # one testbench with a different random seed
+make parallel        # cycles per inference at NUM_MACS = 1, 4, 8, 16, 32
 make mac-waves       # short run that writes waveforms/mac_tb.vcd (also relu-, ctrl-, matmul-, layer-, net-waves)
 make help            # list every target
 ```
@@ -364,3 +365,44 @@ Measured results (seed 1), with 0 errors on both Verilator 5.052 and Icarus
 
 Of the 1,725 cycles, 848 go to loading weights and 874 to computing. Phases 7
 and 8 target exactly that.
+
+## Phase 7: parallel MACs (`NUM_MACS`)
+
+`NUM_MACS` sets how many output columns are computed at once. Every MAC sees
+the same activation; MAC *p* reads its own weight `B[k][j_base + p]` and keeps
+its own accumulator. A group of that many columns takes K cycles whatever its
+width, and then streams out one column per cycle:
+
+```
+compute + write-back cycles = M · ceil(N / NUM_MACS) · K + M · N
+```
+
+When N is not a multiple of `NUM_MACS` the last group is short; the spare MACs
+repeat the last column so their addresses stay in range, and their results are
+never streamed out. `NUM_MACS = 1` is the original schedule.
+
+**Measured cycles** (`make parallel`). Simulated cycle counts only: no clock
+frequency is implied, and none of this is an FPGA measurement.
+
+| NUM_MACS | Network (16-32-10) | Speedup | Layer 16→32 | Layer compute only |
+|----------|--------------------|---------|-------------|--------------------|
+| 1        | 1,725              | 1.00×   | 1,074       | 544                |
+| 4        | 1,117              | 1.54×   | 690         | 160                |
+| 8        | 1,021              | 1.69×   | 626         | 96                 |
+| 16       | 957                | 1.80×   | 594         | 64                 |
+| 32       | 941                | 1.83×   | 578         | 48                 |
+
+The compute phase scales nearly linearly — the 16→32 layer's compute falls
+from 544 cycles to 48, which is 11.3× with 32 MACs — but the end-to-end figure
+does not, because weight loading is unchanged at one byte per cycle. For the
+network, 848 of the 1,725 baseline cycles are weight beats, and at 32 MACs
+those same 848 cycles are 90% of the remaining 941. Past about 8 MACs, more
+multipliers buy very little; the bottleneck is the weight port, not the
+arithmetic.
+
+**Verification.** Every existing testbench takes `NUM_MACS` and checks the
+cycle formula exactly for that width, and the NumPy checks run at each one, so
+the parallel configurations are proven to compute identical results, not just
+similar ones. The regression runs the matrix multiply at 1 and 4 MACs (square
+and non-square), the controller at 1 and 4, the layer at 1 and 8, and the
+network at 1, 4 and 8.
