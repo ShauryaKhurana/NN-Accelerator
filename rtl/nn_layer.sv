@@ -11,7 +11,7 @@
 //                          B[j] ------------------------------>[ + ]
 //                       (INT32, held steady)                      |
 //                                                                 v
-//                                                             [ relu ] --> m_data (INT32)
+//                                                       [ relu (optional) ] --> m_data
 //
 // The multiplier from Phase 4 does the dot products: a 1 x K by K x N multiply
 // is exactly this layer's X * W. Its output beats arrive in order, one per
@@ -30,6 +30,9 @@
 // design it would sit in a small register file written once per layer. It
 // must hold steady while the layer is busy. Element j is at
 // bias_flat[j*ACC_WIDTH +: ACC_WIDTH].
+//
+// APPLY_RELU = 0 leaves the sum as it is, for an output layer that produces
+// raw logits rather than activations.
 //
 // Numeric range: the dot product of K INT8 pairs fits comfortably in INT32
 // (at most K * 2^14 in magnitude). Adding the bias wraps modulo 2^32 like any
@@ -50,7 +53,8 @@ module nn_layer #(
     parameter int INPUT_SIZE  = 16,   // length of X, rows of W
     parameter int OUTPUT_SIZE = 8,    // columns of W, length of Y
     parameter int DATA_WIDTH  = 8,    // signed activation / weight width
-    parameter int ACC_WIDTH   = 32    // signed accumulator / bias / output width
+    parameter int ACC_WIDTH   = 32,   // signed accumulator / bias / output width
+    parameter bit APPLY_RELU  = 1'b1  // 0 for an output layer (raw logits)
 ) (
     input  logic                             clk,
     input  logic                             rst,      // synchronous, active-high
@@ -128,12 +132,16 @@ module nn_layer #(
     assign m_valid = dot_valid;
     assign m_last  = dot_last;
 
-    relu #(
-        .WIDTH (ACC_WIDTH)
-    ) u_relu (
-        .x (biased),
-        .y (m_data)
-    );
+    if (APPLY_RELU) begin : g_relu
+        relu #(
+            .WIDTH (ACC_WIDTH)
+        ) u_relu (
+            .x (biased),
+            .y (m_data)
+        );
+    end else begin : g_no_relu
+        assign m_data = biased;
+    end
 
 endmodule
 

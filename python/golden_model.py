@@ -58,14 +58,15 @@ def relu_int32(x):
     return np.maximum(x, 0).astype(np.int32)
 
 
-def layer_relu(x, w, b):
-    """Return Y = ReLU(X @ W + B) for one fully connected INT8 layer.
+def layer_affine(x, w, b):
+    """Return X @ W + B for one fully connected INT8 layer, without ReLU.
 
     X is an INPUT_SIZE vector of INT8 activations, W is INPUT_SIZE x
     OUTPUT_SIZE INT8 weights, and B is one INT32 bias per output. The result
     is OUTPUT_SIZE INT32 values. Both the dot products and the bias add must
     fit INT32, which is what the hardware accumulator holds; anything larger
-    raises rather than wrapping silently.
+    raises rather than wrapping silently. This is what an output layer
+    produces: raw logits.
     """
     x = np.asarray(x)
     if x.ndim != 1:
@@ -83,7 +84,37 @@ def layer_relu(x, w, b):
     total = dot.astype(np.int64) + b.astype(np.int64)
     if total.size and (total.min() < INT32_MIN or total.max() > INT32_MAX):
         raise OverflowError("X @ W + B does not fit the INT32 accumulator")
-    return relu_int32(total.astype(np.int32))
+    return total.astype(np.int32)
+
+
+def layer_relu(x, w, b):
+    """Return Y = ReLU(X @ W + B) for one fully connected INT8 layer."""
+    return relu_int32(layer_affine(x, w, b))
+
+
+def requantize(x, shift, out_bits=8):
+    """Return x >> shift, saturated to a signed out_bits value.
+
+    This mirrors rtl/requant.sv: the shift is arithmetic, so it rounds toward
+    negative infinity (NumPy's >> on a signed integer array does the same),
+    and the result saturates instead of wrapping.
+    """
+    x = np.asarray(x).astype(np.int64)
+    if shift < 0:
+        raise ValueError("shift must be >= 0")
+    lo, hi = -(1 << (out_bits - 1)), (1 << (out_bits - 1)) - 1
+    return np.clip(x >> shift, lo, hi).astype(np.int8)
+
+
+def network_2layer(x, w1, b1, w2, b2, shift=8):
+    """Run the two-layer network of rtl/nn_accelerator.sv.
+
+    ReLU(X @ W1 + B1) in INT32, requantized to INT8, then @ W2 + B2 in INT32.
+    The output layer has no ReLU, so the result is raw logits.
+    """
+    hidden = layer_relu(x, w1, b1)          # INT32, non-negative
+    acts = requantize(hidden, shift)        # INT8
+    return layer_affine(acts, w2, b2)       # INT32 logits
 
 
 # -----------------------------------------------------------------------------
@@ -158,6 +189,10 @@ def self_test(seed=1):
             _expect(got.tolist() == want, f"layer {in_size}x{out_size} {name}: wrong result")
             layer_cases += 1
 
+    # The same layer without ReLU keeps negative sums
+    _expect(int(layer_affine(np.full(16, -128), np.full((16, 4), 127), np.zeros(4, int))[0]) == -260096,
+            "layer_affine should keep the negative sum -260096")
+
     # Hand-computed: 16 inputs of 127 x 127 sum to 258,064; the same with
     # -128 x 127 sums to -260,096 and ReLU clamps it to 0
     _expect(int(layer_relu(np.full(16, 127), np.full((16, 4), 127), np.zeros(4, int))[0]) == 258064,
@@ -173,8 +208,41 @@ def self_test(seed=1):
     else:
         raise AssertionError("a bias overflowing INT32 was accepted")
 
-    print(f"golden_model self-test: PASS ({cases} matrix cases, {layer_cases} layer cases "
-          f"vs. plain Python, hand-computed values, input range checks)")
+    # Requantization, against plain Python integer arithmetic
+    for shift in (0, 1, 8, 15):
+        values = [0, 1, -1, 255, -255, 256, -256, 32512, 32768, -32768, -32769,
+                  INT32_MAX, INT32_MIN] + list(rng.integers(INT32_MIN, INT32_MAX, 200))
+        got = requantize(np.array(values, dtype=np.int64), shift)
+        want = [min(127, max(-128, int(v) >> shift)) for v in values]   # Python >> also floors
+        _expect(got.tolist() == want, f"requantize shift={shift}: wrong result")
+
+    # Two-layer network, against the same arithmetic written out step by step
+    net_cases = 0
+    for in_size, hid_size, out_size in [(16, 32, 10), (4, 3, 2), (1, 1, 1)]:
+        for r in range(10):
+            x = rng.integers(-128, 128, in_size)
+            w1 = rng.integers(-128, 128, (in_size, hid_size))
+            b1 = rng.integers(-5000, 5000, hid_size)
+            w2 = rng.integers(-128, 128, (hid_size, out_size))
+            b2 = rng.integers(-5000, 5000, out_size)
+            got = network_2layer(x, w1, b1, w2, b2, shift=8)
+            hidden = [max(0, sum(int(x[k]) * int(w1[k][j]) for k in range(in_size)) + int(b1[j]))
+                      for j in range(hid_size)]
+            acts = [min(127, max(-128, h >> 8)) for h in hidden]
+            want = [sum(acts[j] * int(w2[j][o]) for j in range(hid_size)) + int(b2[o])
+                    for o in range(out_size)]
+            _expect(got.tolist() == want, f"network {in_size}-{hid_size}-{out_size} case {r}: wrong result")
+            net_cases += 1
+
+    # Hand-computed: all-127 inputs and weights give a hidden sum of 258,064,
+    # which requantizes to 1008 and saturates to 127
+    hidden = layer_relu(np.full(16, 127), np.full((16, 32), 127), np.zeros(32, int))
+    _expect(int(hidden[0]) == 258064, "hidden sum should be 258064")
+    _expect(int(requantize(hidden, 8)[0]) == 127, "258064 >> 8 = 1008 should saturate to 127")
+
+    print(f"golden_model self-test: PASS ({cases} matrix cases, {layer_cases} layer cases, "
+          f"{net_cases} network cases vs. plain Python, requantization at 4 shifts, "
+          f"hand-computed values, input range checks)")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ next one starts.
 | 3     | 8×8 matrix multiply            | done — verified on Verilator and Icarus, and against NumPy |
 | 4     | Control FSM + handshaking      | done — verified on Verilator and Icarus, and against NumPy |
 | 5     | NN layer `ReLU(X·W + B)`       | done — verified on Verilator and Icarus, and against NumPy |
-| 6     | Two-layer network (16→32→10)   | not started |
+| 6     | Two-layer network (16→32→10)   | done — verified on Verilator and Icarus, and against NumPy |
 | 7     | Parallel MAC array             | not started |
 | 8     | Pipelining                     | not started |
 | 9     | Python-driven random regression| not started |
@@ -60,7 +60,7 @@ Check what is installed with `make check-tools`.
 make test            # Verilator: RTL lint + all testbenches (primary)
 make test-iverilog   # Icarus Verilog: the same testbenches (cross-check)
 make mac SEED=1234   # one testbench with a different random seed
-make mac-waves       # short run that writes waveforms/mac_tb.vcd (also relu-, ctrl-, matmul-, layer-waves)
+make mac-waves       # short run that writes waveforms/mac_tb.vcd (also relu-, ctrl-, matmul-, layer-, net-waves)
 make help            # list every target
 ```
 
@@ -295,3 +295,72 @@ Measured results (seed 1), with 0 errors on both Verilator 5.052 and Icarus
 
 Each cycle count matches the formula in the architecture document. Loading the
 weights is the bulk of it: 144 of the 282 cycles at 16 → 8.
+
+## Phase 6: two-layer network (`rtl/nn_accelerator.sv`)
+
+```
+16 inputs → [ layer 1: 16×32, ReLU ] → requantize to INT8 → [ layer 2: 32×10 ] → 10 logits
+```
+
+Two `nn_layer` instances chained through a requantizer. Layer 2 is built with
+`APPLY_RELU = 0`, because an output layer produces raw logits.
+
+**Why a requantizer.** A layer accumulates in INT32, but the next layer's
+multiplier takes INT8, so the activations have to come back down. This is the
+usual fixed-point rescaling, with the scale restricted to a power of two:
+
+```
+x (INT32) → [ >>> SHIFT ] → [ saturate to INT8 ] → y (INT8)
+```
+
+- A constant shift costs no multiplier, just wiring plus a compare and a mux.
+- The shift is arithmetic, so it rounds toward negative infinity, exactly like
+  `>>` on a signed integer in Python and NumPy. Everything stays integer, so
+  the hardware and the golden model agree exactly.
+- Large activations saturate instead of wrapping.
+- `SHIFT` is a parameter (default 8). With 16 INT8 inputs that keeps typical
+  activations near 70 and saturates only the largest few percent.
+
+**Routing.** One counter tracks the beats taken from the host: the first
+16 + 512 feed layer 1, and the remaining 320 are W2. A second counter tracks
+the activations handed to layer 2, and until all 32 have gone through,
+`s_ready` stays low for W2, so the host waits. Layer 2 loads those activations
+while layer 1 is still computing the later ones, so one inference costs less
+than two separate layers.
+
+**Interface.** Input stream: X, then W1, then W2, one INT8 per beat. Output
+stream: 10 logits, one INT32 per beat, with `m_last` on the final one. Both
+bias vectors sit on parallel ports, steady while busy.
+
+| Phase of an inference | Cycles | 16 → 32 → 10 |
+|---|---|---|
+| Layer 1 loads X and W1 | INPUT·(1 + HIDDEN) | 528 |
+| Layer 1 computes (+1 handover) | HIDDEN·(INPUT+1) + 1 | 545 |
+| Layer 2 loads W2 | HIDDEN·OUTPUT | 320 |
+| Layer 2 computes | OUTPUT·(HIDDEN+1) | 330 |
+| IDLE + DONE | 2 | 2 |
+| **Back to back** | | **1,725** |
+
+**Verification.** The testbench checks every logit against a 64-bit reference
+that repeats the whole pipeline, with the same protocol monitor and cycle
+accounting as earlier phases, plus resets at four points (layer 1 load, layer
+1 compute, W2 load, layer 2 compute). `python/verify_results.py network` then
+recomputes each inference with NumPy, requantization included.
+
+One directed test is worth calling out: with X = 0 and identity second-layer
+weights, each logit *is* the requantized activation of its channel, so setting
+biases to 0, one step below a step, exactly one step, 127 steps and beyond
+reads the requantizer's 0, 1, 127 and saturation behavior straight off the
+outputs.
+
+Measured results (seed 1), with 0 errors on both Verilator 5.052 and Icarus
+13.0, and every logit matching NumPy:
+
+| Shape | SHIFT | Inferences | Checks | Logits vs. NumPy | Cycles per inference |
+|-------|-------|------------|--------|------------------|----------------------|
+| 16-32-10 | 8 | 112 | 2,611 | 1,120 | 1,725 |
+| 16-32-10 | 0 | 112 | 2,611 | 1,120 | 1,725 |
+| 4-3-2    | 8 | 111 | 793   | 222   | 48    |
+
+Of the 1,725 cycles, 848 go to loading weights and 874 to computing. Phases 7
+and 8 target exactly that.
