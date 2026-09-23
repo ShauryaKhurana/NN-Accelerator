@@ -14,6 +14,10 @@
 #   make relu-params   ReLU testbench, WIDTH=16, exhaustive over all inputs
 #   make relu-iverilog both ReLU configurations on Icarus Verilog
 #   make relu-waves    short ReLU run that writes waveforms/relu_tb.vcd
+#   make ctrl          matrix-multiply controller FSM testbench, 8x8x8 (Verilator)
+#   make ctrl-params   controller FSM testbench at 1x1x1 and 2x3x2
+#   make ctrl-iverilog all controller configurations on Icarus Verilog
+#   make ctrl-waves    short controller run that writes waveforms/matmul_ctrl_tb.vcd
 #   make matmul        8x8 matrix multiply testbench + NumPy check (Verilator)
 #   make matmul-params matrix multiply at 3x16x5 and 1x16x8, + NumPy check
 #   make matmul-iverilog  all matrix multiply configurations on Icarus Verilog
@@ -42,10 +46,11 @@ SEED ?= 1
 # ---- Sources ----------------------------------------------------------------
 MAC_RTL     := rtl/mac.sv
 RELU_RTL    := rtl/relu.sv
-MATMUL_RTL  := $(MAC_RTL) rtl/matrix_mult.sv
-RTL_SRCS    := $(MAC_RTL) $(RELU_RTL) rtl/matrix_mult.sv
+CTRL_RTL    := rtl/matmul_pkg.sv rtl/matmul_ctrl.sv
+MATMUL_RTL  := rtl/matmul_pkg.sv $(MAC_RTL) rtl/matmul_ctrl.sv rtl/matrix_mult.sv
+RTL_SRCS    := rtl/matmul_pkg.sv $(MAC_RTL) $(RELU_RTL) rtl/matmul_ctrl.sv rtl/matrix_mult.sv
 # Each of these modules is linted as a top level against the full RTL list.
-LINT_TOPS   := mac relu matrix_mult
+LINT_TOPS   := mac relu matmul_ctrl matrix_mult
 
 # ---- Verilator --------------------------------------------------------------
 # --binary       build a standalone simulator from an SV testbench (implies --timing)
@@ -55,7 +60,12 @@ LINT_TOPS   := mac relu matrix_mult
 #                failure instead of hiding behind a convenient 0
 # -Wno-unknown-warning-option  Homebrew's Verilator passes a clang warning flag
 #                that Apple clang does not know; silence that noise
-VERILATOR_FLAGS := --binary -j 0 --trace --x-initial unique --quiet \
+# --unroll-count 1  keep testbench loops as loops. Verilator otherwise unrolls
+#                them into every place a task is used: matrix_mult_tb's main
+#                process became one ~80,000-line C++ function (8.7 MB of C++,
+#                about 30 s to compile); with loops kept it is 1.2 MB and 5 s.
+#                The RTL has no procedural loops, so it is unaffected.
+VERILATOR_FLAGS := --binary -j 0 --trace --x-initial unique --quiet --unroll-count 1 \
                    -CFLAGS -Wno-unknown-warning-option
 VERILATOR_RUN   := +verilator+rand+reset+2 +verilator+seed+$(SEED)
 
@@ -85,15 +95,16 @@ endef
 .PHONY: help check-tools lint test test-iverilog clean venv golden \
         mac mac-params mac-iverilog mac-waves \
         relu relu-params relu-iverilog relu-waves \
+        ctrl ctrl-params ctrl-iverilog ctrl-waves \
         matmul matmul-params matmul-iverilog matmul-waves
 
 help:
-	@grep -E '^#   (make |[A-Z]+=)' Makefile | sed 's/^#   //'
+	@grep -E '^#   (make |[A-Z_]+=)' Makefile | sed 's/^#   //'
 
-test: lint golden mac mac-params relu relu-params matmul matmul-params
+test: lint golden mac mac-params relu relu-params ctrl ctrl-params matmul matmul-params
 	@echo "== make test: all Verilator checks passed =="
 
-test-iverilog: golden mac-iverilog relu-iverilog matmul-iverilog
+test-iverilog: golden mac-iverilog relu-iverilog ctrl-iverilog matmul-iverilog
 	@echo "== make test-iverilog: all Icarus checks passed =="
 
 lint:
@@ -132,6 +143,23 @@ relu-iverilog:
 relu-waves:
 	$(call verilator_run,relu_tb,$(RELU_RTL) tb/relu_tb.sv,relu_tb,,+dumpfile=$(WAVE_DIR)/relu_tb.vcd)
 	@echo "wrote $(WAVE_DIR)/relu_tb.vcd -- open it with: surfer $(WAVE_DIR)/relu_tb.vcd"
+
+# Controller FSM on its own: every output, state and counter checked each cycle
+ctrl:
+	$(call verilator_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb,)
+
+ctrl-params:
+	$(call verilator_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb_1x1x1,-GM=1 -GK=1 -GN=1 -GN_JOBS=400)
+	$(call verilator_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb_2x3x2,-GM=2 -GK=3 -GN=2 -GN_JOBS=400)
+
+ctrl-iverilog:
+	$(call iverilog_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb,)
+	$(call iverilog_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb_1x1x1,-Pmatmul_ctrl_tb.M=1 -Pmatmul_ctrl_tb.K=1 -Pmatmul_ctrl_tb.N=1 -Pmatmul_ctrl_tb.N_JOBS=400)
+	$(call iverilog_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb_2x3x2,-Pmatmul_ctrl_tb.M=2 -Pmatmul_ctrl_tb.K=3 -Pmatmul_ctrl_tb.N=2 -Pmatmul_ctrl_tb.N_JOBS=400)
+
+ctrl-waves:
+	$(call verilator_run,matmul_ctrl_tb,$(CTRL_RTL) tb/matmul_ctrl_tb.sv,matmul_ctrl_tb,,+dumpfile=$(WAVE_DIR)/matmul_ctrl_tb.vcd)
+	@echo "wrote $(WAVE_DIR)/matmul_ctrl_tb.vcd -- open it with: surfer $(WAVE_DIR)/matmul_ctrl_tb.vcd"
 
 # Matrix multiply: the testbench checks C against its own reference model and
 # also writes every multiply to a results file, which python/verify_results.py
