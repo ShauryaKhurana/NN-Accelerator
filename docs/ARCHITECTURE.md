@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the hardware as built so far. It will grow as later
-phases add the neural-network layer, parallel MACs and pipelining.
+phases add the multi-layer network, parallel MACs and pipelining.
 
 ## Blocks
 
@@ -11,6 +11,7 @@ phases add the neural-network layer, parallel MACs and pipelining.
 | ReLU           | `rtl/relu.sv`         | `y = x < 0 ? 0 : x` on INT32, combinational                 |
 | Matrix multiply| `rtl/matrix_mult.sv`  | Streaming C = A × B datapath: operand memory + one MAC      |
 | Controller     | `rtl/matmul_ctrl.sv`  | FSM that sequences a matrix-multiply job                    |
+| Layer          | `rtl/nn_layer.sv`     | `Y = ReLU(X · W + B)`: the multiplier plus bias and ReLU    |
 | Shared types   | `rtl/matmul_pkg.sv`   | Controller state encoding                                   |
 
 ## Matrix multiplier
@@ -154,3 +155,59 @@ cycle can start.
   M·N·K = 512 (72.5%). The rest is loading (128 cycles), write-back beats
   (64), and IDLE plus DONE (2). Overlapping these with computation, and
   adding MACs, is the subject of Phases 7 and 8.
+
+## Fully connected layer
+
+`Y = ReLU(X · W + B)` for one layer: X is a vector of INPUT_SIZE signed INT8
+activations, W is INPUT_SIZE × OUTPUT_SIZE signed INT8 weights, B is one
+signed INT32 bias per output, and Y is OUTPUT_SIZE signed INT32 values. The
+default is 16 inputs and 8 outputs.
+
+```
+ s_data -->[ matrix_mult (M=1, K=INPUT_SIZE, N=OUTPUT_SIZE) ]--+
+ (X then W, INT8)        X . W[:,j], INT32                     |
+                                                               v
+                        B[j] ------------------------------>[ + ]
+                     (INT32, held steady)                      |
+                                                               v
+                                                           [ relu ] --> m_data (INT32)
+```
+
+- **Reuse.** A 1 × K by K × N multiply is exactly X · W, so the layer
+  instantiates the matrix multiplier with M = 1 and adds two things: the bias
+  and the ReLU.
+- **Bias select.** The multiplier emits one beat per output channel, in
+  order, so a counter that follows the output handshakes picks the matching
+  bias. It returns to channel 0 on the beat carrying `m_last`.
+- **No extra cycles.** The bias add and ReLU are combinational, so the layer
+  keeps the multiplier's schedule exactly. While an output waits to be
+  accepted, the MAC holds its accumulator, so the offered value is stable.
+- **Bias interface.** The bias is a parallel input, not part of the stream:
+  there is one per output channel, it is INT32 while the stream is INT8, and
+  in a larger design it would live in a small register file written once per
+  layer. It must hold steady while the layer is busy.
+
+### Numeric range
+
+A dot product of K INT8 pairs is at most K · 2¹⁴ in magnitude, which leaves
+plenty of INT32 headroom. Adding the bias wraps modulo 2³² like any
+two's-complement add, so any bias with magnitude up to 2³¹ − 1 − K · 2¹⁴
+can never wrap; for K = 16 that is ±2,147,221,503. The testbench checks the
+largest non-wrapping sum (which gives exactly 2,147,483,647) and one step
+past it, where the sum wraps negative and ReLU clamps the output to 0.
+ReLU is applied after the bias, so Y is never negative.
+
+### Cycles per inference
+
+| Phase                       | Cycles (general)                                 | 16 → 8 |
+|-----------------------------|--------------------------------------------------|--------|
+| IDLE, seeing `s_valid`      | 1                                                | 1      |
+| LOAD (X then W)             | INPUT_SIZE + INPUT_SIZE·OUTPUT_SIZE              | 144    |
+| COMPUTE + WRITEBACK         | OUTPUT_SIZE · (INPUT_SIZE + 1)                   | 136    |
+| DONE                        | 1                                                | 1      |
+| **Back to back**            | **the sum of the above**                         | **282** |
+
+Measured back-to-back periods: 282 cycles at 16 → 8, 33 at 4 → 3, and 684 at
+32 → 10, each matching the formula. Loading the weights dominates: 144 of the
+282 cycles. A design that kept weights on-chip across inferences would not
+pay it every time, which is one of the things Phases 7 and 8 look at.

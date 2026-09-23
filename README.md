@@ -15,7 +15,7 @@ next one starts.
 | 2     | ReLU                           | done — verified on Verilator and Icarus |
 | 3     | 8×8 matrix multiply            | done — verified on Verilator and Icarus, and against NumPy |
 | 4     | Control FSM + handshaking      | done — verified on Verilator and Icarus, and against NumPy |
-| 5     | NN layer `ReLU(X·W + B)`       | not started |
+| 5     | NN layer `ReLU(X·W + B)`       | done — verified on Verilator and Icarus, and against NumPy |
 | 6     | Two-layer network (16→32→10)   | not started |
 | 7     | Parallel MAC array             | not started |
 | 8     | Pipelining                     | not started |
@@ -60,7 +60,7 @@ Check what is installed with `make check-tools`.
 make test            # Verilator: RTL lint + all testbenches (primary)
 make test-iverilog   # Icarus Verilog: the same testbenches (cross-check)
 make mac SEED=1234   # one testbench with a different random seed
-make mac-waves       # short run that writes waveforms/mac_tb.vcd (also relu-, ctrl-, matmul-waves)
+make mac-waves       # short run that writes waveforms/mac_tb.vcd (also relu-, ctrl-, matmul-, layer-waves)
 make help            # list every target
 ```
 
@@ -244,3 +244,54 @@ Measured results (seed 1), with 0 errors on both Verilator 5.052 and Icarus
 
 Every element matches NumPy, and for each shape the Verilator and Icarus
 results files are byte-identical.
+
+## Phase 5: fully connected layer (`rtl/nn_layer.sv`)
+
+`Y = ReLU(X · W + B)` for one layer: X is a vector of INPUT_SIZE signed INT8
+activations, W is INPUT_SIZE × OUTPUT_SIZE signed INT8 weights, B is one
+signed INT32 bias per output, and Y is OUTPUT_SIZE signed INT32 values. The
+default is 16 inputs and 8 outputs, and both are parameters.
+
+The layer reuses the Phase 4 multiplier: a 1 × K by K × N multiply is exactly
+X · W. It adds a bias, selected by a counter that follows the output beats,
+and the Phase 2 ReLU. Both are combinational, so the layer keeps the
+multiplier's schedule and adds no cycles.
+
+- **Input stream:** X, then W row-major, one INT8 per beat (same protocol as
+  the multiplier).
+- **Bias:** one INT32 per output channel on a parallel port, held steady while
+  the layer is busy. It is not on the stream because there is one per output,
+  it is INT32 while the stream is INT8, and in a larger design it would sit in
+  a small register file written once per layer.
+- **Output stream:** Y, one INT32 per beat, `m_last` on the final output.
+- **Numeric range:** any bias up to 2³¹ − 1 − INPUT_SIZE · 2¹⁴ in magnitude can
+  never make the sum wrap (±2,147,221,503 for 16 inputs). The testbench checks
+  the largest non-wrapping sum and one step past it, where the sum wraps
+  negative and ReLU clamps the output to 0.
+
+Full details, including the cycle-count table, are in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+**Verification.** The testbench checks every output against a 64-bit reference
+(dot product, bias with the documented wrap, then ReLU), and the same protocol
+and cycle accounting as Phase 4: outputs hold steady while stalled, exact beat
+counts, one-cycle `done`, exact busy cycles plus one per stall, and resets
+during LOAD, COMPUTE and WRITEBACK. `python/verify_results.py layer` then
+re-checks every logged inference against the NumPy golden model.
+
+Directed cases cover zeros, bias only, all 127, sums that ReLU clamps to 0, a
+bias that lifts a negative sum back up or pushes a positive sum below zero
+(including the exact zero crossing), identity weights, and both sides of the
+INT32 edge.
+
+Measured results (seed 1), with 0 errors on both Verilator 5.052 and Icarus
+13.0, and every logged output matching NumPy:
+
+| Shape (inputs → outputs) | Inferences | Checks | Outputs vs. NumPy | Cycles per inference |
+|--------------------------|------------|--------|-------------------|----------------------|
+| 16 → 8                   | 215        | 4,122  | 1,712             | 282                  |
+| 4 → 3                    | 215        | 1,962  | 642               | 33                   |
+| 32 → 10                  | 215        | 4,986  | 2,140             | 684                  |
+
+Each cycle count matches the formula in the architecture document. Loading the
+weights is the bulk of it: 144 of the 282 cycles at 16 → 8.
