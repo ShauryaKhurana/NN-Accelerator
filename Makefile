@@ -22,6 +22,10 @@
 #   make matmul-params matrix multiply at 3x16x5 and 1x16x8, + NumPy check
 #   make matmul-iverilog  all matrix multiply configurations on Icarus Verilog
 #   make matmul-waves  short matrix multiply run that writes waveforms/matrix_mult_tb.vcd
+#   make layer         NN layer testbench, 16->8 + NumPy check (Verilator)
+#   make layer-params  NN layer at 4->3 and 32->10, + NumPy check
+#   make layer-iverilog  all NN layer configurations on Icarus Verilog
+#   make layer-waves   short NN layer run that writes waveforms/nn_layer_tb.vcd
 #   make golden        self-test of the NumPy golden model (python/golden_model.py)
 #   make venv          create .venv with the Python dependencies (numpy)
 #   make check-tools   report which simulators / tools are installed
@@ -48,9 +52,10 @@ MAC_RTL     := rtl/mac.sv
 RELU_RTL    := rtl/relu.sv
 CTRL_RTL    := rtl/matmul_pkg.sv rtl/matmul_ctrl.sv
 MATMUL_RTL  := rtl/matmul_pkg.sv $(MAC_RTL) rtl/matmul_ctrl.sv rtl/matrix_mult.sv
-RTL_SRCS    := rtl/matmul_pkg.sv $(MAC_RTL) $(RELU_RTL) rtl/matmul_ctrl.sv rtl/matrix_mult.sv
+LAYER_RTL   := $(MATMUL_RTL) $(RELU_RTL) rtl/nn_layer.sv
+RTL_SRCS    := rtl/matmul_pkg.sv $(MAC_RTL) $(RELU_RTL) rtl/matmul_ctrl.sv rtl/matrix_mult.sv rtl/nn_layer.sv
 # Each of these modules is linted as a top level against the full RTL list.
-LINT_TOPS   := mac relu matmul_ctrl matrix_mult
+LINT_TOPS   := mac relu matmul_ctrl matrix_mult nn_layer
 
 # ---- Verilator --------------------------------------------------------------
 # --binary       build a standalone simulator from an SV testbench (implies --timing)
@@ -96,15 +101,17 @@ endef
         mac mac-params mac-iverilog mac-waves \
         relu relu-params relu-iverilog relu-waves \
         ctrl ctrl-params ctrl-iverilog ctrl-waves \
-        matmul matmul-params matmul-iverilog matmul-waves
+        matmul matmul-params matmul-iverilog matmul-waves \
+        layer layer-params layer-iverilog layer-waves
 
 help:
 	@grep -E '^#   (make |[A-Z_]+=)' Makefile | sed 's/^#   //'
 
-test: lint golden mac mac-params relu relu-params ctrl ctrl-params matmul matmul-params
+test: lint golden mac mac-params relu relu-params ctrl ctrl-params matmul matmul-params \
+      layer layer-params
 	@echo "== make test: all Verilator checks passed =="
 
-test-iverilog: golden mac-iverilog relu-iverilog ctrl-iverilog matmul-iverilog
+test-iverilog: golden mac-iverilog relu-iverilog ctrl-iverilog matmul-iverilog layer-iverilog
 	@echo "== make test-iverilog: all Icarus checks passed =="
 
 lint:
@@ -185,6 +192,29 @@ matmul-iverilog:
 matmul-waves:
 	$(call verilator_run,matrix_mult_tb,$(MATMUL_RTL) tb/matrix_mult_tb.sv,matrix_mult_tb,,+dumpfile=$(WAVE_DIR)/matrix_mult_tb.vcd)
 	@echo "wrote $(WAVE_DIR)/matrix_mult_tb.vcd -- open it with: surfer $(WAVE_DIR)/matrix_mult_tb.vcd"
+
+# NN layer: same two-reference scheme as the matrix multiply
+# $(call layer_run,<simulator run macro>,<run name>,<build flags>,<simulator>)
+define layer_run
+	$(call $(1),nn_layer_tb,$(LAYER_RTL) tb/nn_layer_tb.sv,$(2),$(3),+resultsfile=$(SIM_DIR)/$(2).$(4).results.txt)
+	$(PYTHON) python/verify_results.py layer $(SIM_DIR)/$(2).$(4).results.txt
+endef
+
+layer:
+	$(call layer_run,verilator_run,nn_layer_tb,,verilator)
+
+layer-params:
+	$(call layer_run,verilator_run,nn_layer_tb_4x3,-GINPUT_SIZE=4 -GOUTPUT_SIZE=3,verilator)
+	$(call layer_run,verilator_run,nn_layer_tb_32x10,-GINPUT_SIZE=32 -GOUTPUT_SIZE=10,verilator)
+
+layer-iverilog:
+	$(call layer_run,iverilog_run,nn_layer_tb,,iverilog)
+	$(call layer_run,iverilog_run,nn_layer_tb_4x3,-Pnn_layer_tb.INPUT_SIZE=4 -Pnn_layer_tb.OUTPUT_SIZE=3,iverilog)
+	$(call layer_run,iverilog_run,nn_layer_tb_32x10,-Pnn_layer_tb.INPUT_SIZE=32 -Pnn_layer_tb.OUTPUT_SIZE=10,iverilog)
+
+layer-waves:
+	$(call verilator_run,nn_layer_tb,$(LAYER_RTL) tb/nn_layer_tb.sv,nn_layer_tb,,+dumpfile=$(WAVE_DIR)/nn_layer_tb.vcd)
+	@echo "wrote $(WAVE_DIR)/nn_layer_tb.vcd -- open it with: surfer $(WAVE_DIR)/nn_layer_tb.vcd"
 
 golden:
 	$(PYTHON) python/golden_model.py
