@@ -15,8 +15,10 @@
 //
 // Stream protocol (both directions): a beat transfers on a rising edge where
 // valid and ready are both high.
-//   input   M*K elements of A, then K*N elements of B, each row-major, one
-//           signed INT8 per beat on s_data
+//   input   with load_weights high: K*N elements of B, row-major, one signed
+//           INT8 per beat; they stay resident for later jobs.
+//           with load_weights low: M*K elements of A, then the job computes
+//           C = A x B with the weights already loaded.
 //   output  M*N elements of C, row-major, one signed INT32 per beat on m_data.
 //           m_last marks the final element. While m_valid is high and m_ready
 //           is low, m_data and m_last hold steady.
@@ -46,7 +48,9 @@ module matrix_mult #(
 ) (
     input  logic                         clk,
     input  logic                         rst,       // synchronous, active-high
-    // Input stream: A, then B
+    // Job kind, sampled with the first beat: 1 = load weights, 0 = inference
+    input  logic                         load_weights,
+    // Input stream: B for a weight load, A for an inference
     input  logic                         s_valid,
     output logic                         s_ready,
     input  logic signed [DATA_WIDTH-1:0] s_data,
@@ -82,23 +86,24 @@ module matrix_mult #(
         .N        (N),
         .NUM_MACS (NUM_MACS)
     ) u_ctrl (
-        .clk       (clk),
-        .rst       (rst),
-        .s_valid   (s_valid),
-        .s_ready   (s_ready),
-        .m_valid   (m_valid),
-        .m_ready   (m_ready),
-        .m_last    (m_last),
-        .busy      (busy),
-        .done      (done),
-        .ld_en     (ld_en),
-        .ld_idx    (ld_idx),
-        .mac_en    (mac_en),
-        .mac_clear (mac_clear),
-        .i         (i),
-        .j_base    (j_base),
-        .k         (k),
-        .wb_sel    (wb_sel)
+        .clk          (clk),
+        .rst          (rst),
+        .load_weights (load_weights),
+        .s_valid      (s_valid),
+        .s_ready      (s_ready),
+        .m_valid      (m_valid),
+        .m_ready      (m_ready),
+        .m_last       (m_last),
+        .busy         (busy),
+        .done         (done),
+        .ld_en        (ld_en),
+        .ld_idx       (ld_idx),
+        .mac_en       (mac_en),
+        .mac_clear    (mac_clear),
+        .i            (i),
+        .j_base       (j_base),
+        .k            (k),
+        .wb_sel       (wb_sel)
     );
 
     // -------------------------------------------------------------------------

@@ -288,11 +288,14 @@ parallel:
 	    grep -q '^TEST PASSED' $(SIM_DIR)/parallel_p$$p.log || exit 1; \
 	    c=$$(sed -n 's/^TEST PASSED.*0 errors, \([0-9]*\) cycles per inference back to back.*/\1/p' \
 	          $(SIM_DIR)/parallel_p$$p.log); \
-	    echo "$$p $$c" >> $(SIM_DIR)/parallel.txt; \
+	    w=$$(sed -n 's/.*every weight load: busy \([0-9]*\) cycles.*/\1/p' \
+	          $(SIM_DIR)/parallel_p$$p.log | head -1); \
+	    echo "$$p $$c $$w" >> $(SIM_DIR)/parallel.txt; \
 	done
 	@echo ""
-	@echo "16-32-10 network, cycles per inference (simulated; no frequency implied)"
-	@awk 'NR==1 {base=$$2} {printf "  %3d MACs  %6d cycles  %5.2fx\n", $$1, $$2, base/$$2}' $(SIM_DIR)/parallel.txt
+	@echo "16-32-10 network with weights resident (simulated cycles; no frequency implied)"
+	@echo "  MACs  per inference  speedup  weight load (once)"
+	@awk 'NR==1 {base=$$2} {printf "  %4d  %13d  %6.2fx  %18d\n", $$1, $$2, base/$$2, $$3}' $(SIM_DIR)/parallel.txt
 
 golden:
 	$(PYTHON) python/golden_model.py

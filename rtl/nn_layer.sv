@@ -21,8 +21,11 @@
 //
 // Streams (same protocol as matrix_mult; a beat transfers on a rising edge
 // where valid and ready are both high):
-//   input   INPUT_SIZE elements of X, then INPUT_SIZE*OUTPUT_SIZE elements of
-//           W row-major (W[k][j] at k*OUTPUT_SIZE + j), one INT8 per beat
+//   input   with load_weights high: INPUT_SIZE*OUTPUT_SIZE elements of W,
+//           row-major (W[k][j] at k*OUTPUT_SIZE + j), one INT8 per beat; the
+//           weights stay resident.
+//           with load_weights low: INPUT_SIZE elements of X, then the
+//           inference runs against the resident weights.
 //   output  OUTPUT_SIZE elements of Y, one INT32 per beat, m_last on the last
 //
 // The bias is a parallel input rather than part of the stream: there is one
@@ -42,12 +45,13 @@
 // ReLU is applied after the bias, so Y is never negative.
 //
 // NUM_MACS output channels are computed in parallel (see matmul_ctrl.sv).
-// Cycles per inference, back to back and without stalls:
-//   INPUT_SIZE*(1 + OUTPUT_SIZE)                       load X and W
-//   + ceil(OUTPUT_SIZE/NUM_MACS)*INPUT_SIZE            compute
-//   + OUTPUT_SIZE                                      output beats
-//   + 2                                                IDLE and DONE
-//   = 282 for 16 inputs, 8 outputs and one MAC.
+// Weights are loaded once: INPUT_SIZE*OUTPUT_SIZE + 2 cycles. Each inference
+// after that costs
+//   INPUT_SIZE                                   load X
+//   + ceil(OUTPUT_SIZE/NUM_MACS)*INPUT_SIZE      compute
+//   + OUTPUT_SIZE                                output beats
+//   + 2                                          IDLE and DONE
+//   = 154 for 16 inputs, 8 outputs and one MAC.
 // =============================================================================
 
 `timescale 1ns / 1ps
@@ -63,7 +67,9 @@ module nn_layer #(
 ) (
     input  logic                             clk,
     input  logic                             rst,      // synchronous, active-high
-    // Input stream: X, then W
+    // Job kind, sampled with the first beat: 1 = load weights, 0 = inference
+    input  logic                             load_weights,
+    // Input stream: W for a weight load, X for an inference
     input  logic                             s_valid,
     output logic                             s_ready,
     input  logic signed [DATA_WIDTH-1:0]     s_data,
@@ -96,17 +102,18 @@ module nn_layer #(
         .ACC_WIDTH  (ACC_WIDTH),
         .NUM_MACS   (NUM_MACS)
     ) u_matmul (
-        .clk     (clk),
-        .rst     (rst),
-        .s_valid (s_valid),
-        .s_ready (s_ready),
-        .s_data  (s_data),
-        .m_valid (dot_valid),
-        .m_ready (m_ready),
-        .m_data  (dot),
-        .m_last  (dot_last),
-        .busy    (busy),
-        .done    (done)
+        .clk          (clk),
+        .rst          (rst),
+        .load_weights (load_weights),
+        .s_valid      (s_valid),
+        .s_ready      (s_ready),
+        .s_data       (s_data),
+        .m_valid      (dot_valid),
+        .m_ready      (m_ready),
+        .m_data       (dot),
+        .m_last       (dot_last),
+        .busy         (busy),
+        .done         (done)
     );
 
     // -------------------------------------------------------------------------

@@ -18,7 +18,7 @@ next one starts.
 | 5     | NN layer `ReLU(X·W + B)`       | done — verified on Verilator and Icarus, and against NumPy |
 | 6     | Two-layer network (16→32→10)   | done — verified on Verilator and Icarus, and against NumPy |
 | 7     | Parallel MAC array             | done — verified on Verilator and Icarus, and against NumPy |
-| 8     | Pipelining                     | not started |
+| 8     | Weight reuse + pipelining      | done — verified on Verilator and Icarus, and against NumPy |
 | 9     | Python-driven random regression| not started |
 | 10    | Waveform tooling               | not started |
 | 11    | Performance report             | not started |
@@ -177,6 +177,10 @@ all −128 case it returns 0 instead of 131,072.
 
 ## Phase 4: controller FSM and streaming interface
 
+> The cycle counts in this section were measured before Phase 8, when every
+> job streamed its weights. Weights are now loaded once and reused, so the
+> current figures are lower; see [Phase 8](#phase-8-weight-reuse-and-pipelining).
+
 The matrix multiplier is now a streaming block with valid/ready handshakes,
 sequenced by a separate controller (`rtl/matmul_ctrl.sv`).
 
@@ -248,6 +252,10 @@ results files are byte-identical.
 
 ## Phase 5: fully connected layer (`rtl/nn_layer.sv`)
 
+> The cycle counts in this section were measured before Phase 8, when every
+> job streamed its weights. Weights are now loaded once and reused, so the
+> current figures are lower; see [Phase 8](#phase-8-weight-reuse-and-pipelining).
+
 `Y = ReLU(X · W + B)` for one layer: X is a vector of INPUT_SIZE signed INT8
 activations, W is INPUT_SIZE × OUTPUT_SIZE signed INT8 weights, B is one
 signed INT32 bias per output, and Y is OUTPUT_SIZE signed INT32 values. The
@@ -298,6 +306,10 @@ Each cycle count matches the formula in the architecture document. Loading the
 weights is the bulk of it: 144 of the 282 cycles at 16 → 8.
 
 ## Phase 6: two-layer network (`rtl/nn_accelerator.sv`)
+
+> The cycle counts in this section were measured before Phase 8, when every
+> job streamed its weights. Weights are now loaded once and reused, so the
+> current figures are lower; see [Phase 8](#phase-8-weight-reuse-and-pipelining).
 
 ```
 16 inputs → [ layer 1: 16×32, ReLU ] → requantize to INT8 → [ layer 2: 32×10 ] → 10 logits
@@ -381,8 +393,9 @@ When N is not a multiple of `NUM_MACS` the last group is short; the spare MACs
 repeat the last column so their addresses stay in range, and their results are
 never streamed out. `NUM_MACS = 1` is the original schedule.
 
-**Measured cycles** (`make parallel`). Simulated cycle counts only: no clock
-frequency is implied, and none of this is an FPGA measurement.
+**Measured cycles as of Phase 7**, when every inference still streamed its own
+weights. Simulated cycle counts only: no clock frequency is implied, and none
+of this is an FPGA measurement.
 
 | NUM_MACS | Network (16-32-10) | Speedup | Layer 16→32 | Layer compute only |
 |----------|--------------------|---------|-------------|--------------------|
@@ -398,7 +411,7 @@ does not, because weight loading is unchanged at one byte per cycle. For the
 network, 848 of the 1,725 baseline cycles are weight beats, and at 32 MACs
 those same 848 cycles are 90% of the remaining 941. Past about 8 MACs, more
 multipliers buy very little; the bottleneck is the weight port, not the
-arithmetic.
+arithmetic. That is what Phase 8 fixes, and the table is re-measured there.
 
 **Verification.** Every existing testbench takes `NUM_MACS` and checks the
 cycle formula exactly for that width, and the NumPy checks run at each one, so
@@ -406,3 +419,92 @@ the parallel configurations are proven to compute identical results, not just
 similar ones. The regression runs the matrix multiply at 1 and 4 MACs (square
 and non-square), the controller at 1 and 4, the layer at 1 and 8, and the
 network at 1, 4 and 8.
+
+## Phase 8: weight reuse and pipelining
+
+Phase 7 ended with a clear bottleneck: no number of MACs could do better than
+1.83×, because every inference re-streamed its weights one byte per cycle.
+Phase 8 takes the weights out of the per-inference path.
+
+**The interface change.** A new `load_weights` input, sampled with a job's
+first beat, says what kind of job this is:
+
+| `load_weights` | Stream carries | Produces | Cost (16-32-10, 1 MAC) |
+|----------------|----------------|----------|------------------------|
+| 1              | W1 then W2     | nothing  | 834 cycles, paid once  |
+| 0              | X              | 10 logits| 893 cycles each        |
+
+Weights stay in the operand memory between jobs, so a run of *n* inferences
+costs 834 + 893·*n* cycles instead of 1,725·*n* — or 834 + 860·*n* if the host
+keeps the next X offered rather than waiting for `done` (see **Pipelining**
+below). The bias stays a parallel INT32 port and can change per inference
+without reloading anything.
+
+The FSM latches the job kind in IDLE and picks the operand-memory region from
+it: a weight load writes the B region and goes straight to DONE; an inference
+writes the A region and goes on to COMPUTE. At the network level a beat
+counter splits a weight-load stream between the two layers.
+
+**Measured cycles** (`make parallel`). Simulated cycle counts only: no clock
+frequency is implied, and none of this is an FPGA measurement.
+
+| NUM_MACS | Cycles per inference | Speedup | vs. Phase 7 | Weight load (once) |
+|----------|----------------------|---------|-------------|--------------------|
+| 1        | 893                  | 1.00×   | 1.93×       | 834                |
+| 4        | 285                  | 3.13×   | 3.92×       | 834                |
+| 8        | 189                  | 4.72×   | 5.40×       | 834                |
+| 16       | 125                  | 7.14×   | 7.66×       | 834                |
+| 32       | 109                  | 8.19×   | 8.63×       | 834                |
+
+The "Speedup" column is against one MAC in this design; "vs. Phase 7" is
+against the same width when weights were streamed every time. Parallel MACs
+now earn their keep: the ceiling rises from 1.83× to 8.19×, and the 16-32-10
+inference goes from 1,725 cycles to 109 — 15.8× over the Phase 7 baseline.
+
+**Pipelining.** The layers overlap at their boundary: layer 2 consumes each
+activation in the cycle layer 1 produces it. Measured at one MAC, the two
+layers cost 561 and 363 cycles standalone but 892 together — exactly
+HIDDEN_SIZE = 32 cycles saved.
+
+Inferences overlap too, but only partly. A host that waits for `done` gets one
+inference every 893 cycles; one that keeps the next X offered gets one every
+860, because layer 1 is a separate FSM and starts early. It runs ahead only
+until its own first write-back — there is no buffer between the layers — so
+the gain is a steady 33 cycles at every width: 3.7% of 893 at one MAC, but 30%
+of 109 at thirty-two, where it is enough to reach the slower layer's own period
+of 76 and keep layer 1 busy continuously.
+
+The stage breakdown, the measured intervals at each width, the MAC utilization
+figures and the full hazard list are in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#pipelining-latency-and-throughput).
+
+**Verification.** All four streaming testbenches model the two job kinds and
+check the cycle count of each exactly. New checks:
+
+- The weight-reuse test loads once, runs three inferences, and requires each
+  to cost only its own cycles and to start exactly one interval after the
+  previous one.
+- A source offers the next inference's first beat while the current one is
+  computing; for the single matrix multiplier `s_ready` must stay low until it
+  is back in LOAD.
+- The network is streamed the same X four times without waiting for `done`.
+  Every logit of every inference is checked, and the interval must be steady,
+  strictly better than waiting for `done`, and no better than the slower layer
+  running alone.
+- Resets now land in a weight load's W1 and W2 phases as well as in an
+  inference's load, compute and write-back.
+- The controller testbench's reference model latches the job kind in IDLE and
+  derives the load address and exit state from it, exactly as the RTL does.
+
+Measured with 0 errors on Verilator 5.052 and Icarus 13.0, all NumPy checks
+passing at every configuration in `make test`.
+
+As a one-off check (not automated in the repo), 10 deliberately injected bugs
+in the new logic were run: 9 were caught and 1 is equivalent. The nine include
+ignoring the job kind, writing weights over the activation region, ending a
+weight load after M·K beats, letting a weight load fall through to COMPUTE,
+an off-by-one in the W1/W2 split, a weight counter that never resets, and
+routing the host stream to the wrong layer. The equivalent one drops the
+`!load_weights` guard on layer 1's output-ready signal; the testbench now
+asserts the invariant that makes it redundant — layer 1 never offers an
+activation during a weight load — so the guard is documentation, not logic.

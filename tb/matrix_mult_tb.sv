@@ -16,12 +16,16 @@
 // Every completed job's A, B and received C go to the results file, which
 // python/verify_results.py checks against the NumPy golden model.
 //
+// Weights stay resident: a job is either a weight load (B) or an inference
+// (A, then the results). Each directed case loads its weights and runs one
+// inference; the reuse test loads once and runs several.
+//
 // Sections
 //   1. directed    identity patterns, zeros, all 127, all -128, -128 x 127,
 //                  a checkerboard of extremes, an index pattern; no stalls,
-//                  back to back, exact cycle counts
-//   2. protocol    input gaps, output backpressure, both; a source that
-//                  queues the next job while the current one computes;
+//                  exact cycle counts
+//   2. protocol    input gaps, output backpressure, both; weights reused by
+//                  back-to-back inferences, with the spacing checked;
 //                  reset during LOAD, COMPUTE and WRITEBACK
 //   3. random      N_RANDOM jobs with random matrices and stall rates
 //   +  coverage    every bin must be hit at least once
@@ -54,18 +58,22 @@ module matrix_mult_tb;
     localparam int ACC_WIDTH   = 32;
     localparam int CLK_PERIOD  = 10;
     localparam int MAX_ERRORS  = 10;
-    localparam int LOAD_BEATS  = M*K + K*N;
-    localparam int GROUPS      = (N + NUM_MACS - 1) / NUM_MACS;
-    // load, then per row: one group of NUM_MACS columns every K cycles, then
-    // one output beat per column; plus DONE
-    localparam int BUSY_CYCLES = LOAD_BEATS + M*GROUPS*K + M*N + 1;
-    localparam int PERIOD      = BUSY_CYCLES + 1;                // plus the IDLE cycle
+    localparam int A_BEATS  = M*K;                   // one inference's A
+    localparam int W_BEATS  = K*N;                   // one weight load
+    localparam int GROUPS   = (N + NUM_MACS - 1) / NUM_MACS;
+    // A weight load is its beats plus DONE. An inference loads A, then per row
+    // computes a group of NUM_MACS columns every K cycles and emits one beat
+    // per column, plus DONE.
+    localparam int W_BUSY   = W_BEATS + 1;
+    localparam int INF_BUSY = A_BEATS + M*GROUPS*K + M*N + 1;
+    localparam int PERIOD   = INF_BUSY + 1;          // back-to-back inferences
 
     // -------------------------------------------------------------------------
     // DUT
     // -------------------------------------------------------------------------
     logic                         clk = 1'b0;
     logic                         rst;
+    logic                         load_weights;
     logic                         s_valid;
     logic                         s_ready;
     logic signed [DATA_WIDTH-1:0] s_data;
@@ -84,9 +92,10 @@ module matrix_mult_tb;
         .ACC_WIDTH  (ACC_WIDTH),
         .NUM_MACS   (NUM_MACS)
     ) dut (
-        .clk     (clk),
-        .rst     (rst),
-        .s_valid (s_valid),
+        .clk          (clk),
+        .rst          (rst),
+        .load_weights (load_weights),
+        .s_valid      (s_valid),
         .s_ready (s_ready),
         .s_data  (s_data),
         .m_valid (m_valid),
@@ -109,6 +118,7 @@ module matrix_mult_tb;
     longint c_got [2][M][N];
 
     int unsigned n_checks = 0, n_errors = 0, n_jobs = 0;
+    int unsigned n_logged = 0;      // jobs written to the results file (weight loads write none)
     int unsigned sec_checks = 0, sec_errors = 0, sec_jobs = 0;
     int unsigned seed        = 1;
     // Separate random streams for the main sequence, the source and the sink.
@@ -124,6 +134,11 @@ module matrix_mult_tb;
     string       run_note    = "";
     int          results_fd  = 0;
 
+    // What the monitor should see for the job now running; the driver sets
+    // these before it starts.
+    int unsigned exp_busy = 0, exp_in = 0, exp_out = 0;
+    string       exp_kind = "inference";
+
     // Monitor state
     longint      cycle = 0;
     int unsigned job_in = 0, job_out = 0, job_lasts = 0, job_busy = 0, job_stalls = 0;
@@ -136,6 +151,7 @@ module matrix_mult_tb;
     // Coverage
     int unsigned cov_pos = 0, cov_neg = 0, cov_zero = 0, cov_max = 0, cov_min = 0;
     int unsigned cov_gap = 0, cov_backpressure = 0, cov_source_wait = 0, cov_back_to_back = 0;
+    int unsigned cov_weight_reuse = 0;
     int unsigned cov_reset_load = 0, cov_reset_compute = 0, cov_reset_writeback = 0;
 
     // -------------------------------------------------------------------------
@@ -200,6 +216,11 @@ module matrix_mult_tb;
         if (n_errors >= MAX_ERRORS) end_test();
     endtask
 
+    // Only A: the resident weights are left alone
+    task automatic fill_random_a(input int slot);
+        for (int i = 0; i < M; i++) for (int k = 0; k < K; k++) a_mat[slot][i][k] = rand_operand();
+    endtask
+
     task automatic fill_random(input int slot);
         for (int i = 0; i < M; i++) for (int k = 0; k < K; k++) a_mat[slot][i][k] = rand_operand();
         for (int k = 0; k < K; k++) for (int j = 0; j < N; j++) b_mat[slot][k][j] = rand_operand();
@@ -259,12 +280,12 @@ module matrix_mult_tb;
             if (done) begin
                 n_checks++;
                 if (prev_done) error("done high for more than one cycle");
-                if (job_in != LOAD_BEATS || job_out != M*N || job_lasts != 1)
-                    error($sformatf("job had %0d input beats, %0d output beats, %0d m_last (expected %0d, %0d, 1)",
-                                    job_in, job_out, job_lasts, LOAD_BEATS, M*N));
-                if (job_busy != BUSY_CYCLES + job_stalls)
-                    error($sformatf("job busy for %0d cycles, expected %0d + %0d stalls",
-                                    job_busy, BUSY_CYCLES, job_stalls));
+                if (job_in != exp_in || job_out != exp_out || job_lasts != (exp_out > 0 ? 1 : 0))
+                    error($sformatf("%s had %0d input beats, %0d output beats, %0d m_last (expected %0d, %0d, %0d)",
+                                    exp_kind, job_in, job_out, job_lasts, exp_in, exp_out, (exp_out > 0) ? 1 : 0));
+                if (job_busy != exp_busy + job_stalls)
+                    error($sformatf("%s busy for %0d cycles, expected %0d + %0d stalls",
+                                    exp_kind, job_busy, exp_busy, job_stalls));
                 last_busy   = job_busy;
                 last_period = (last_done_cycle >= 0) ? cycle - last_done_cycle : 0;
                 last_done_cycle = cycle;
@@ -282,7 +303,8 @@ module matrix_mult_tb;
     // it stays high until the beat is accepted. s_ready depends only on the
     // DUT's state, so sampling it at the falling edge tells whether the beat
     // transfers on the next rising edge.
-    task automatic send(input int slot, input int gap_pct, input int n_beats);
+    // is_weights selects B (a weight load) or A (an inference)
+    task automatic send(input int slot, input int gap_pct, input int n_beats, input bit is_weights);
         int value;
         bit taken;
         for (int e = 0; e < n_beats; e++) begin
@@ -290,8 +312,8 @@ module matrix_mult_tb;
                 s_valid = 1'b0;
                 @(negedge clk);
             end
-            value   = (e < M*K) ? a_mat[slot][e / K][e % K]
-                                : b_mat[slot][(e - M*K) / N][(e - M*K) % N];
+            value   = is_weights ? b_mat[slot][e / N][e % N]
+                                 : a_mat[slot][e / K][e % K];
             s_valid = 1'b1;
             s_data  = DATA_WIDTH'(value);
             do begin
@@ -339,6 +361,7 @@ module matrix_mult_tb;
     // Append one job's A, B and received C to the results file.
     task automatic log_result(input int slot, input string name);
         if (results_fd == 0) return;
+        n_logged++;
         $fwrite(results_fd, "case %s\nA", name);
         for (int i = 0; i < M; i++) for (int k = 0; k < K; k++) $fwrite(results_fd, " %0d", a_mat[slot][i][k]);
         $fwrite(results_fd, "\nB");
@@ -359,10 +382,39 @@ module matrix_mult_tb;
         if (done !== 1'b0 || busy !== 1'b0) error($sformatf("%s: done or busy still high a cycle later", name));
     endtask
 
+    // Load slot's B into the DUT; it stays resident for later inferences.
+    task automatic load_weights_job(input int slot, input int gap_pct);
+        exp_kind     = "weight load";
+        exp_busy     = W_BUSY;
+        exp_in       = W_BEATS;
+        exp_out      = 0;
+        load_weights = 1'b1;
+        send(slot, gap_pct, W_BEATS, 1'b1);
+        load_weights = 1'b0;                       // already latched; only IDLE samples it
+        while (done !== 1'b1) @(negedge clk);      // a weight load produces no output
+        n_jobs++;
+        @(negedge clk);                            // the monitor closes the job at this edge
+        n_checks += 2;
+        if (done !== 1'b0 || busy !== 1'b0) error("weight load: done or busy still high a cycle later");
+        if (last_busy < W_BUSY)
+            error($sformatf("weight load busy %0d cycles, expected %0d + stalls", last_busy, W_BUSY));
+    endtask
+
+    // Load slot 0's weights, then run one inference against them
+    task automatic load_and_run(input string name, input int gap_pct, input int stall_pct);
+        load_weights_job(0, gap_pct);
+        run_job(name, gap_pct, stall_pct);
+    endtask
+
+    // One inference against the resident weights
     task automatic run_job(input string name, input int gap_pct, input int stall_pct);
         compute_expected(0);
+        exp_kind = "inference";
+        exp_busy = INF_BUSY;
+        exp_in   = A_BEATS;
+        exp_out  = M*N;
         fork
-            send(0, gap_pct, LOAD_BEATS);
+            send(0, gap_pct, A_BEATS, 1'b0);
             receive(0, name, stall_pct);
         join
         finish_job(0, name);
@@ -413,7 +465,7 @@ module matrix_mult_tb;
 
     task automatic end_test();
         if (results_fd != 0) begin
-            $fwrite(results_fd, "end %0d\n", n_jobs);
+            $fwrite(results_fd, "end %0d\n", n_logged);
             $fclose(results_fd);
             results_fd = 0;
         end
@@ -434,12 +486,14 @@ module matrix_mult_tb;
     // -------------------------------------------------------------------------
     // A job with no stalls: busy must be exact, and when it directly follows
     // another job (back_to_back), so must the spacing between their done pulses.
-    task automatic directed_job(input string name, input bit back_to_back);
+    // Load this case's weights, then run one inference against them
+    task automatic directed_job(input string name, input bit unused_arg);
+        load_weights_job(0, 0);
         run_job(name, 0, 0);
         n_checks++;
-        if (last_busy != BUSY_CYCLES) error($sformatf("%s: busy %0d cycles, expected %0d", name, last_busy, BUSY_CYCLES));
-        if (back_to_back && last_period != longint'(PERIOD))
-            error($sformatf("%s: %0d cycles since the previous job, expected %0d", name, last_period, PERIOD));
+        if (last_busy != INF_BUSY)
+            error($sformatf("%s: busy %0d cycles, expected %0d", name, last_busy, INF_BUSY));
+        if (unused_arg) begin end   // spacing is checked by the weight-reuse test
     endtask
 
     task automatic test_directed();
@@ -480,46 +534,79 @@ module matrix_mult_tb;
         for (int k = 0; k < K; k++) for (int j = 0; j < N; j++) b_mat[0][k][j] = 127 - (3*(k*N + j)) % 256;
         directed_job("index pattern", 1'b1);
 
-        $display("  pass  every job: busy %0d cycles; back-to-back jobs %0d cycles apart", BUSY_CYCLES, PERIOD);
+        $display("  pass  every weight load: busy %0d cycles; every inference: %0d cycles",
+                 W_BUSY, INF_BUSY);
         section_end();
     endtask
 
     task automatic test_protocol();
-        section_begin("2. protocol: stalls, a queued second job, resets");
+        section_begin("2. protocol: stalls, weights reused, resets");
 
         fill_random(0);
-        run_job("input gaps", 50, 0);
+        load_and_run("input gaps", 50, 0);
         $display("  pass  input gaps (s_valid low 50%% of cycles): busy %0d cycles", last_busy);
         fill_random(0);
-        run_job("output backpressure", 0, 50);
+        load_and_run("output backpressure", 0, 50);
         $display("  pass  output backpressure (m_ready low 50%%): busy %0d cycles", last_busy);
         fill_random(0);
-        run_job("gaps and backpressure", 70, 70);
+        load_and_run("gaps and backpressure", 70, 70);
         $display("  pass  both (70%%): busy %0d cycles", last_busy);
 
-        // The source offers the second job's first beat as soon as the first
-        // job is loaded; it must wait (s_ready low) until the next LOAD.
+        // Weights loaded once, then three inferences back to back: each must
+        // cost only INF_BUSY cycles, and they must be PERIOD cycles apart.
         fill_random(0);
+        load_weights_job(0, 0);
+        for (int r = 0; r < 3; r++) begin
+            fill_random_a(0);
+            run_job($sformatf("weights reused, inference %0d", r), 0, 0);
+            n_checks++;
+            if (last_busy != INF_BUSY)
+                error($sformatf("reused-weight inference busy %0d cycles, expected %0d",
+                                last_busy, INF_BUSY));
+            if (r > 0) begin
+                n_checks++;
+                if (last_period != longint'(PERIOD))
+                    error($sformatf("inferences %0d cycles apart, expected %0d", last_period, PERIOD));
+            end
+        end
+        cov_weight_reuse++;
+        $display("  pass  weights loaded once, 3 inferences of %0d cycles, %0d apart", INF_BUSY, PERIOD);
+
+        // The source offers the next inference's first beat while the current
+        // one is still computing; the DUT must hold it off (s_ready low) until
+        // it reaches LOAD again, and the spacing must still be PERIOD.
+        fill_random_a(0);
+        fill_random_a(1);
+        for (int kk = 0; kk < K; kk++)                 // slot 1 sees the resident weights
+            for (int jj = 0; jj < N; jj++) b_mat[1][kk][jj] = b_mat[0][kk][jj];
         compute_expected(0);
-        fill_random(1);
         compute_expected(1);
+        exp_kind = "inference";
+        exp_busy = INF_BUSY;
+        exp_in   = A_BEATS;
+        exp_out  = M*N;
         fork
             begin
-                send(0, 0, LOAD_BEATS);
-                send(1, 0, LOAD_BEATS);
+                send(0, 0, A_BEATS, 1'b0);
+                send(1, 0, A_BEATS, 1'b0);             // queued during the first
             end
             begin
-                receive(0, "queued: first job", 0);
-                finish_job(0, "queued: first job");
-                receive(1, "queued: second job", 0);
-                finish_job(1, "queued: second job");
+                receive(0, "queued: first inference", 0);
+                finish_job(0, "queued: first inference");
+                receive(1, "queued: second inference", 0);
+                finish_job(1, "queued: second inference");
             end
         join
-        $display("  pass  second job queued during the first: accepted only after the first finished");
+        n_checks++;
+        if (last_period != longint'(PERIOD))
+            error($sformatf("queued inference started %0d cycles after the previous, expected %0d",
+                            last_period, PERIOD));
+        $display("  pass  next inference queued during the current one: accepted only at the next LOAD");
 
         // Reset during LOAD, COMPUTE and WRITEBACK; the next job must be exact
         fill_random(0);
-        send(0, 0, LOAD_BEATS / 2);
+        load_weights = 1'b0;
+        send(0, 0, A_BEATS / 2, 1'b0);
         n_checks++;
         if (s_ready !== 1'b1) error("expected to be in LOAD");
         apply_reset("LOAD");
@@ -528,7 +615,7 @@ module matrix_mult_tb;
         directed_job("after reset in LOAD", 1'b0);
 
         fill_random(0);
-        send(0, 0, LOAD_BEATS);                        // now in the first COMPUTE cycle
+        send(0, 0, A_BEATS, 1'b0);                     // now in the first COMPUTE cycle
         repeat ((K > 1) ? K / 2 : 0) @(negedge clk);
         n_checks++;
         if (!(busy && !s_ready && !m_valid && !done)) error("expected to be in COMPUTE");
@@ -539,7 +626,7 @@ module matrix_mult_tb;
 
         fill_random(0);
         m_ready = 1'b0;
-        send(0, 0, LOAD_BEATS);
+        send(0, 0, A_BEATS, 1'b0);
         while (m_valid !== 1'b1) @(negedge clk);       // first element offered ...
         repeat (3) @(negedge clk);                      // ... and held
         apply_reset("WRITEBACK");
@@ -555,8 +642,14 @@ module matrix_mult_tb;
         logic [31:0] r;
         section_begin($sformatf("3. random (%0d jobs, seed %0d)", N_RANDOM, seed));
         for (int t = 0; t < N_RANDOM; t++) begin
-            fill_random(0);
             r = rand32();
+            if (t == 0 || r[7:6] == 2'b00) begin        // new weights for about a quarter of them
+                fill_random(0);
+                load_weights_job(0, stall_rate(r[1:0]));
+            end else begin
+                fill_random_a(0);                       // the rest reuse the resident weights
+                cov_weight_reuse++;
+            end
             repeat (int'(r[5:4])) @(negedge clk);       // 0-3 idle cycles before some jobs
             run_job($sformatf("random %0d", t), stall_rate(r[1:0]), stall_rate(r[3:2]));
         end
@@ -574,6 +667,7 @@ module matrix_mult_tb;
         cover_bin("backpressure cycles (m_ready low)",  cov_backpressure);
         cover_bin("source waiting while busy",          cov_source_wait);
         cover_bin("back-to-back job starts",            cov_back_to_back);
+        cover_bin("weights reused across inferences",   cov_weight_reuse);
         cover_bin("reset during LOAD",                  cov_reset_load);
         cover_bin("reset during COMPUTE",               cov_reset_compute);
         cover_bin("reset during WRITEBACK",             cov_reset_writeback);
@@ -599,11 +693,12 @@ module matrix_mult_tb;
             $dumpvars(0, matrix_mult_tb);
         end
 
-        $display("matrix_mult_tb: C[%0dx%0d] = A[%0dx%0d] x B[%0dx%0d], streamed; %0d busy cycles per job without stalls",
-                 M, N, M, K, K, N, BUSY_CYCLES);
+        $display("matrix_mult_tb: C[%0dx%0d] = A[%0dx%0d] x B[%0dx%0d], weights resident; %0d cycles per weight load, %0d per inference",
+                 M, N, M, K, K, N, W_BUSY, INF_BUSY);
 
-        rst     = 1'b1;
-        s_valid = 1'b0;
+        rst          = 1'b1;
+        load_weights = 1'b0;
+        s_valid      = 1'b0;
         s_data  = '0;
         m_ready = 1'b0;
         repeat (2) @(negedge clk);
