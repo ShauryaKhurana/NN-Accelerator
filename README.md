@@ -19,7 +19,7 @@ next one starts.
 | 6     | Two-layer network (16→32→10)   | done — verified on Verilator and Icarus, and against NumPy |
 | 7     | Parallel MAC array             | done — verified on Verilator and Icarus, and against NumPy |
 | 8     | Weight reuse + pipelining      | done — verified on Verilator and Icarus, and against NumPy |
-| 9     | Python-driven random regression| not started |
+| 9     | Python-driven random regression| done — verified on Verilator and Icarus, and against NumPy |
 | 10    | Waveform tooling               | not started |
 | 11    | Performance report             | not started |
 | 12    | Documentation                  | not started |
@@ -508,3 +508,90 @@ routing the host stream to the wrong layer. The equivalent one drops the
 `!load_weights` guard on layer 1's output-ready signal; the testbench now
 asserts the invariant that makes it redundant — layer 1 never offers an
 activation during a weight load — so the guard is documentation, not logic.
+
+## Phase 9: Python-driven random regression
+
+Up to here the testbenches invented their own stimulus and Python checked the
+results. Phase 9 turns that around: **Python generates the vectors, the RTL
+consumes them, and Python checks what comes back.** One command, nonzero exit
+on anything wrong.
+
+```sh
+make regression               # 1,000 cases per DUT on Verilator
+make regression-stalls        # the same with random gaps and backpressure
+make regression-iverilog      # the same on Icarus Verilog
+make regression-all           # every simulator / MAC width / shape combination
+CASES=5000 make regression    # more cases
+```
+
+`python/run_regression.py` does the whole loop: generate random INT8 operands
+and the directed edge cases, compute the expected outputs with NumPy, write a
+vector file, build and run the simulation, parse the results, compare, and
+report every mismatch.
+
+**Two DUTs, because they see different things.**
+
+| DUT | Testbench | What it reaches |
+|-----|-----------|-----------------|
+| `network` | `tb/nn_accelerator_vec_tb.sv` | the whole datapath end to end, but hidden activations are ReLU'd and requantized to INT8, so the accumulator's full width never reaches the output |
+| `matmul`  | `tb/matrix_mult_vec_tb.sv`   | one level down, where every element of C leaves as a raw signed INT32, so large negative accumulations are checked directly |
+
+**The vector files** are plain whitespace-separated integers, read with
+`$fscanf` (no comments — `$fscanf` cannot skip them). They are laid out for
+the weight-stationary interface, so weights are loaded once per group and
+reused by the inferences in it:
+
+```
+INPUT_SIZE HIDDEN_SIZE OUTPUT_SIZE SHIFT N_GROUPS
+per group:  N_CASES, W1, B1, W2, B2, then N_CASES x X
+```
+
+The header must match the parameters the testbench was built with, so a
+mismatched vector file fails loudly instead of being silently misread.
+
+**Edge cases**, generated before the random ones: all zeros, all 127, all
+-128, -128 x 127 and 127 x -128, the largest and most negative accumulations
+paired with the largest bias that still cannot wrap INT32, a checkerboard of
+the extremes, small magnitudes around zero, an identity-like W1, and an index
+pattern. One random group in four (one in three for the matmul) is drawn only
+from -128 and 127, so large accumulations stay well represented instead of
+averaging out.
+
+**Measured.** `make regression`, seed 1, 0 errors. `CASES` counts the
+*randomized* cases; the directed ones run on top of it.
+
+| Run | Cases | Values checked vs. NumPy |
+|-----|-------|--------------------------|
+| network, 16-32-10 | 1,000 randomized + 15 directed, over 135 weight groups | 10,150 logits |
+| matmul, 8x8x8     | 1,000 randomized + 10 directed, over 133 weight groups | 64,640 elements |
+
+That takes about a second on Verilator and a few seconds on Icarus. Also run
+clean: with `--stalls`, at `NUM_MACS` 4 and 8, at other seeds, on Icarus, and
+at the non-default shapes 4-3-2 and 3x16x5.
+
+**Does it actually catch anything?** Six deliberately injected bugs, one-off
+and not automated in the repo:
+
+| Injected bug | Result |
+|--------------|--------|
+| MAC product one bit too narrow | caught — `all -128`: C = -131072, NumPy 131072 |
+| layer drops the bias | caught — 270 of 400 logits differ |
+| weight load overwrites the activation region | caught — simulation failed |
+| `s_ready` never asserts | caught — watchdog, exit 1 (not a hang) |
+| every MAC streams out of MAC 0 (`NUM_MACS=4`) | caught — 243 of 400 differ |
+| requantizer uses a logical shift | **not caught** |
+
+The last one is not a gap in the regression; it is unreachable from either
+DUT. Layer 1 applies ReLU, so the requantizer's input in the network is never
+negative, and `>>>` and `>>` agree on non-negative values. The matmul DUT has
+no requantizer at all. `requant_tb` drives the requantizer directly with
+negative values and does catch it, which is why that unit testbench exists
+and why `make test` runs both.
+
+The first row shows what the matmul DUT adds. Both DUTs caught that one, but
+only the matmul DUT reports it in the accumulator's own terms — it names the
+`all -128` case and prints C = -131072 against NumPy's 131072, the sign flip
+from a 15-bit product. The network reports ten differing logits per case with
+the cause two layers back. The matmul DUT also checks far more values for the
+same number of cases, 64,640 against 10,150, because nothing is reduced to
+INT8 on the way out.

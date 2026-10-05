@@ -506,3 +506,50 @@ and 32 MACs.
   nothing in the hardware records whether weights were ever loaded: reset
   returns the FSM to IDLE and leaves the operand memory untouched. A host that
   infers before loading gets arithmetic on whatever was there.
+
+## Verification flow
+
+Two complementary flows, both run by `make test`.
+
+**Testbench-driven** (`tb/*_tb.sv`). Each module has a self-checking
+testbench that generates its own stimulus, models the expected behaviour
+cycle by cycle, and checks timing as well as values: exact busy-cycle counts
+under random stalls, protocol rules on every clock edge, resets from every
+state, and coverage bins that fail the run if a hole is left. These are what
+catch a schedule or handshake bug. Several of them also write a results file
+that `python/verify_results.py` checks against NumPy.
+
+**Vector-driven** (`tb/*_vec_tb.sv`, `python/run_regression.py`). Python
+generates the operands, computes the expected outputs with NumPy, writes a
+vector file, runs the simulation, and compares. These testbenches invent
+nothing and check no timing; their job is volume and Python-chosen
+distributions. `make regression` runs 1,000 cases against each of two DUTs.
+
+```
+  python/run_regression.py
+      |  numpy: random INT8 operands + directed edge cases
+      v
+  vectors/regression_<dut>_<sim>.txt        (plain integers, read with $fscanf)
+      |
+      v
+  tb/nn_accelerator_vec_tb.sv  or  tb/matrix_mult_vec_tb.sv
+      |  drives the weight-stationary interface: one weight load per group,
+      |  then one inference per case
+      v
+  sim/regression_<dut>_<sim>.results.txt    (the format verify_results.py reads)
+      |
+      v
+  python/run_regression.py  ->  numpy golden model  ->  exit 0 or nonzero
+```
+
+The two levels see different things. The network testbench exercises the
+whole datapath but its hidden activations are ReLU'd and requantized to INT8,
+so the accumulator's full width never reaches an output. The matrix-multiply
+testbench sits one level down, where every element of C leaves as a raw
+signed INT32 — the same 1,000 cases check 64,640 values there against 10,150
+logits at the top.
+
+Neither reaches the requantizer's sign behaviour: in the network ReLU keeps
+its input non-negative, so an arithmetic and a logical right shift agree, and
+the matrix multiplier has no requantizer. `tb/requant_tb.sv` drives it
+directly with negative values, which is why the unit testbenches stay.
