@@ -32,6 +32,10 @@
 //
 // Plusargs:   +vectors=<path>  (required)  +resultsfile=<path>  +seed=<n>
 //             +stalls  drives random input gaps and output backpressure
+//             +dumpfile=<path>  write a waveform
+//             +maxcases=<n>     stop after n cases. Use it with +dumpfile:
+//                               $dumpoff is ignored by the simulator, so the
+//                               only way to keep a trace small is fewer cases.
 // Parameters: INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE, SHIFT, NUM_MACS
 // =============================================================================
 
@@ -100,8 +104,16 @@ module nn_accelerator_vec_tb;
         .done         (done)
     );
 
-    initial clk = 1'b0;
+    // Declared here, before the process that drives it: Icarus rejects a
+    // forward reference that Verilator accepts.
+    longint cycle;                   // free-running, handy as a waveform cursor
+
+    initial begin
+        clk   = 1'b0;
+        cycle = 0;
+    end
     always #(CLK_PERIOD / 2) clk = ~clk;
+    always @(posedge clk) cycle <= cycle + 1;
 
     // -------------------------------------------------------------------------
     // Vectors and bookkeeping
@@ -114,8 +126,9 @@ module nn_accelerator_vec_tb;
     longint y_got  [OUTPUT_SIZE];
 
     int unsigned n_errors = 0, n_cases = 0, n_groups = 0;
+    int          max_cases = 0;          // 0 = no limit
     int          vec_fd = 0, results_fd = 0;
-    string       vectors = "", resultsfile = "";
+    string       vectors = "", resultsfile = "", dumpfile = "";
     logic [31:0] rng = 32'h1;
     bit          use_stalls = 1'b0;
 
@@ -267,6 +280,11 @@ module nn_accelerator_vec_tb;
         int seed;
         if ($value$plusargs("seed=%d", seed)) rng = (seed == 0) ? 32'h1 : 32'(seed);
         use_stalls = $test$plusargs("stalls");
+        if (!$value$plusargs("maxcases=%d", max_cases)) max_cases = 0;
+        if ($value$plusargs("dumpfile=%s", dumpfile)) begin
+            $dumpfile(dumpfile);
+            $dumpvars(0, nn_accelerator_vec_tb);
+        end
 
         if (!$value$plusargs("vectors=%s", vectors))
             $fatal(1, "nn_accelerator_vec_tb: +vectors=<path> is required");
@@ -310,6 +328,7 @@ module nn_accelerator_vec_tb;
         rst = 1'b0;
 
         for (int g = 0; g < hdr_groups; g++) begin
+            if (max_cases != 0 && n_cases >= max_cases) break;
             group_cases = read_int("N_CASES");
             for (int k = 0; k < INPUT_SIZE; k++)
                 for (int j = 0; j < HIDDEN_SIZE; j++) w1_mat[k][j] = read_int("W1");
@@ -327,6 +346,7 @@ module nn_accelerator_vec_tb;
             n_groups++;
 
             for (int c = 0; c < group_cases; c++) begin
+                if (max_cases != 0 && n_cases >= max_cases) break;
                 for (int k = 0; k < INPUT_SIZE; k++) x_vec[k] = read_int("X");
                 run_inference();
                 log_case(g, c);
