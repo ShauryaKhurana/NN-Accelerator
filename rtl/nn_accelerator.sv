@@ -21,32 +21,35 @@
 // into range; see rtl/requant.sv. Everything stays integer, so the hardware
 // and the NumPy golden model agree exactly.
 //
-// Stream protocol (same valid/ready rules as the layers):
-//   input   X (INPUT_SIZE), then W1 (INPUT_SIZE*HIDDEN_SIZE), then
-//           W2 (HIDDEN_SIZE*OUTPUT_SIZE), all row-major, one INT8 per beat
+// Weights stay resident. There are two kinds of job, selected by the
+// load_weights input, which the host holds steady for the whole job:
+//
+//   load_weights = 1   W1 (INPUT_SIZE*HIDDEN_SIZE beats) followed by
+//                      W2 (HIDDEN_SIZE*OUTPUT_SIZE beats), row-major. A beat
+//                      counter routes the first group to layer 1 and the rest
+//                      to layer 2. Nothing comes out.
+//   load_weights = 0   one inference: X (INPUT_SIZE beats) into layer 1. Its
+//                      activations flow through the requantizer into layer 2,
+//                      whose logits leave on the output stream.
+//
 //   output  OUTPUT_SIZE logits, one INT32 per beat, m_last on the last
 //   bias    bias1_flat and bias2_flat are parallel inputs, one INT32 per
 //           output channel of their layer, steady while busy
 //
-// Routing: a beat counter decides where each input beat goes. The first
-// INPUT_SIZE + INPUT_SIZE*HIDDEN_SIZE beats feed layer 1. Layer 2 takes its
-// HIDDEN_SIZE activations from layer 1 (through the requantizer) and only
-// then accepts the W2 beats from the host, so `s_ready` stays low for W2
-// until the activations have gone through.
+// The two layers overlap. Within one inference, layer 2 takes each activation
+// in the cycle layer 1 produces it, so the pair costs less than the two run
+// separately. Across inferences, layer 1 can start the next X while layer 2
+// is still computing, but only until its own first write-back: there is no
+// buffer between the layers, so layer 1 then stalls until layer 2 is back in
+// LOAD. The gain is therefore bounded, not the full "slowest stage" rate.
 //
-// Layer 2 loads its activations while layer 1 is still computing the later
-// ones, which is why the total is less than the sum of two separate layers.
-// Cycles per inference, no stalls (16 -> 32 -> 10 in brackets):
-//   1                              IDLE, seeing the first beat
-//   + INPUT_SIZE*(1 + HIDDEN_SIZE) layer 1 loads X and W1          [528]
-//   + ceil(HIDDEN/NUM_MACS)*INPUT_SIZE + HIDDEN_SIZE + 1
-//                                  layer 1 computes and streams;
-//                                  the first activation waits one
-//                                  cycle for layer 2 to leave IDLE [545]
-//   + HIDDEN_SIZE*OUTPUT_SIZE      layer 2 loads W2                [320]
-//   + ceil(OUTPUT/NUM_MACS)*HIDDEN_SIZE + OUTPUT_SIZE
-//                                  layer 2 computes and streams    [330]
-//   + 1                            DONE                            [1]
+// Cycles with no stalls (16 -> 32 -> 10, one MAC / eight MACs):
+//   weight load          INPUT*HIDDEN + 1 + HIDDEN*OUTPUT + 1        [834]
+//   one inference, busy  INPUT + ceil(HIDDEN/P)*INPUT + HIDDEN + 1
+//                        + ceil(OUTPUT/P)*HIDDEN + OUTPUT + 1  [892 / 188]
+//   host waits for done  the above + 1                         [893 / 189]
+//   next X always offered, measured                            [860 / 156]
+// See docs/ARCHITECTURE.md for the stage breakdown and the hazards.
 // =============================================================================
 
 `timescale 1ns / 1ps
@@ -63,7 +66,9 @@ module nn_accelerator #(
 ) (
     input  logic                             clk,
     input  logic                             rst,      // synchronous, active-high
-    // Input stream: X, then W1, then W2
+    // Job kind, held steady for the whole job: 1 = load W1 then W2, 0 = inference
+    input  logic                             load_weights,
+    // Input stream: weights, or one X vector
     input  logic                             s_valid,
     output logic                             s_ready,
     input  logic signed [DATA_WIDTH-1:0]     s_data,
@@ -80,49 +85,40 @@ module nn_accelerator #(
     output logic                             done      // one-cycle pulse after the last logit
 );
 
-    localparam int L1_BEATS   = INPUT_SIZE + INPUT_SIZE*HIDDEN_SIZE;   // X and W1
-    localparam int W2_BEATS   = HIDDEN_SIZE*OUTPUT_SIZE;
-    localparam int HOST_BEATS = L1_BEATS + W2_BEATS;
-    localparam int HC_W       = $clog2(HOST_BEATS + 1);
-    localparam int AC_W       = $clog2(HIDDEN_SIZE + 1);
+    localparam int W1_BEATS = INPUT_SIZE*HIDDEN_SIZE;
+    localparam int W2_BEATS = HIDDEN_SIZE*OUTPUT_SIZE;
+    localparam int W_BEATS  = W1_BEATS + W2_BEATS;
+    localparam int WC_W     = $clog2(W_BEATS + 1);
 
     // -------------------------------------------------------------------------
     // Beat routing
     // -------------------------------------------------------------------------
-    logic [HC_W-1:0] host_cnt;   // input beats taken from the host this inference
-    logic [AC_W-1:0] act_cnt;    // activations handed from layer 1 to layer 2
-    logic            host_to_l1; // host beats still belong to layer 1
-    logic            acts_left;  // layer 2 is still taking activations
+    // During a weight load, a counter splits the stream: the first W1_BEATS go
+    // to layer 1, the rest to layer 2. It resets whenever load_weights is low,
+    // so an inference always starts the count clean.
+    logic [WC_W-1:0] w_cnt;
+    logic            w_to_l1;
 
-    assign host_to_l1 = (host_cnt < HC_W'(L1_BEATS));
-    assign acts_left  = (act_cnt  < AC_W'(HIDDEN_SIZE));
+    assign w_to_l1 = load_weights && (w_cnt < WC_W'(W1_BEATS));
 
-    logic                        l1_s_valid, l1_s_ready;
-    logic                        l1_m_valid, l1_m_ready, l1_m_last, l1_busy, l1_done;
-    logic signed [ACC_WIDTH-1:0] l1_m_data;
+    logic                         l1_s_valid, l1_s_ready;
+    logic                         l1_m_valid, l1_m_ready, l1_m_last, l1_busy, l1_done;
+    logic signed [ACC_WIDTH-1:0]  l1_m_data;
     logic signed [DATA_WIDTH-1:0] act;           // requantized activation
-    logic                        l2_s_valid, l2_s_ready, l2_busy;
+    logic                         l2_s_valid, l2_s_ready, l2_busy;
     logic signed [DATA_WIDTH-1:0] l2_s_data;
 
-    assign l1_s_valid = s_valid && host_to_l1;
-    assign l1_m_ready = acts_left && l2_s_ready;
+    assign l1_s_valid = s_valid && (load_weights ? w_to_l1 : 1'b1);
+    assign l1_m_ready = !load_weights && l2_s_ready;
 
-    assign l2_s_valid = acts_left ? l1_m_valid : (s_valid && !host_to_l1);
-    assign l2_s_data  = acts_left ? act        : s_data;
+    assign l2_s_valid = load_weights ? (s_valid && !w_to_l1) : l1_m_valid;
+    assign l2_s_data  = load_weights ? s_data : act;
 
-    assign s_ready    = host_to_l1 ? l1_s_ready : (!acts_left && l2_s_ready);
+    assign s_ready    = load_weights ? (w_to_l1 ? l1_s_ready : l2_s_ready) : l1_s_ready;
 
     always_ff @(posedge clk) begin
-        if (rst) begin
-            host_cnt <= '0;
-            act_cnt  <= '0;
-        end else if (done) begin                       // start the next inference clean
-            host_cnt <= '0;
-            act_cnt  <= '0;
-        end else begin
-            if (s_valid && s_ready)       host_cnt <= host_cnt + HC_W'(1);
-            if (l1_m_valid && l1_m_ready) act_cnt  <= act_cnt  + AC_W'(1);
-        end
+        if (rst || !load_weights) w_cnt <= '0;
+        else if (s_valid && s_ready) w_cnt <= w_cnt + WC_W'(1);
     end
 
     // -------------------------------------------------------------------------
@@ -136,18 +132,19 @@ module nn_accelerator #(
         .APPLY_RELU  (1'b1),
         .NUM_MACS    (NUM_MACS)
     ) u_layer1 (
-        .clk       (clk),
-        .rst       (rst),
-        .s_valid   (l1_s_valid),
-        .s_ready   (l1_s_ready),
-        .s_data    (s_data),
-        .bias_flat (bias1_flat),
-        .m_valid   (l1_m_valid),
-        .m_ready   (l1_m_ready),
-        .m_data    (l1_m_data),
-        .m_last    (l1_m_last),
-        .busy      (l1_busy),
-        .done      (l1_done)
+        .clk          (clk),
+        .rst          (rst),
+        .load_weights (load_weights),
+        .s_valid      (l1_s_valid),
+        .s_ready      (l1_s_ready),
+        .s_data       (s_data),
+        .bias_flat    (bias1_flat),
+        .m_valid      (l1_m_valid),
+        .m_ready      (l1_m_ready),
+        .m_data       (l1_m_data),
+        .m_last       (l1_m_last),
+        .busy         (l1_busy),
+        .done         (l1_done)
     );
 
     // -------------------------------------------------------------------------
@@ -173,18 +170,19 @@ module nn_accelerator #(
         .APPLY_RELU  (1'b0),
         .NUM_MACS    (NUM_MACS)
     ) u_layer2 (
-        .clk       (clk),
-        .rst       (rst),
-        .s_valid   (l2_s_valid),
-        .s_ready   (l2_s_ready),
-        .s_data    (l2_s_data),
-        .bias_flat (bias2_flat),
-        .m_valid   (m_valid),
-        .m_ready   (m_ready),
-        .m_data    (m_data),
-        .m_last    (m_last),
-        .busy      (l2_busy),
-        .done      (done)
+        .clk          (clk),
+        .rst          (rst),
+        .load_weights (load_weights),
+        .s_valid      (l2_s_valid),
+        .s_ready      (l2_s_ready),
+        .s_data       (l2_s_data),
+        .bias_flat    (bias2_flat),
+        .m_valid      (m_valid),
+        .m_ready      (m_ready),
+        .m_data       (m_data),
+        .m_last       (m_last),
+        .busy         (l2_busy),
+        .done         (done)
     );
 
     assign busy = l1_busy || l2_busy;

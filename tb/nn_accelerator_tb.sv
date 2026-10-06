@@ -54,16 +54,26 @@ module nn_accelerator_tb;
     localparam int CLK_PERIOD = 10;
     localparam int MAX_ERRORS = 10;
 
-    localparam int L1_BEATS   = INPUT_SIZE + INPUT_SIZE*HIDDEN_SIZE;
+    localparam int W1_BEATS   = INPUT_SIZE*HIDDEN_SIZE;
     localparam int W2_BEATS   = HIDDEN_SIZE*OUTPUT_SIZE;
-    localparam int HOST_BEATS = L1_BEATS + W2_BEATS;
+    localparam int W_BEATS    = W1_BEATS + W2_BEATS;   // one weight load, both layers
+    localparam int X_BEATS    = INPUT_SIZE;            // one inference
     localparam int GROUPS1 = (HIDDEN_SIZE + NUM_MACS - 1) / NUM_MACS;
     localparam int GROUPS2 = (OUTPUT_SIZE + NUM_MACS - 1) / NUM_MACS;
-    // Layer 1 loads and computes; the first activation waits one cycle for
-    // layer 2 to leave IDLE; then W2 loads, layer 2 computes, and DONE.
-    localparam int BUSY_CYCLES = L1_BEATS + GROUPS1*INPUT_SIZE + HIDDEN_SIZE + 1
-                                 + W2_BEATS + GROUPS2*HIDDEN_SIZE + OUTPUT_SIZE + 1;
-    localparam int PERIOD      = BUSY_CYCLES + 1;
+    // A weight load fills layer 1 (W1 beats + DONE), then layer 2 (W2 beats +
+    // DONE); the layers' busy windows do not overlap.
+    localparam int W_BUSY      = W1_BEATS + 1 + W2_BEATS + 1;
+    // An inference: layer 1 loads X and computes; the first activation waits
+    // one cycle for layer 2 to leave IDLE; layer 2 computes, then DONE.
+    localparam int INF_BUSY    = X_BEATS + GROUPS1*INPUT_SIZE + HIDDEN_SIZE + 1
+                                 + GROUPS2*HIDDEN_SIZE + OUTPUT_SIZE + 1;
+    localparam int PERIOD      = INF_BUSY + 1;
+    // Each layer on its own, back to back. With the next X always offered the
+    // two overlap, so the network's interval sits between the slower layer's
+    // period (it can do no better) and PERIOD (it must do better than waiting).
+    localparam int L1_PERIOD   = 1 + INPUT_SIZE  + GROUPS1*INPUT_SIZE  + HIDDEN_SIZE + 1;
+    localparam int L2_PERIOD   = 1 + HIDDEN_SIZE + GROUPS2*HIDDEN_SIZE + OUTPUT_SIZE + 1;
+    localparam int SLOWEST     = (L1_PERIOD > L2_PERIOD) ? L1_PERIOD : L2_PERIOD;
 
     localparam longint ACC_MAX    = (longint'(1) << (ACC_WIDTH - 1)) - 1;
     localparam longint DOT1_MAX   = longint'(INPUT_SIZE) * 16384;
@@ -77,6 +87,7 @@ module nn_accelerator_tb;
     // -------------------------------------------------------------------------
     logic                             clk = 1'b0;
     logic                             rst;
+    logic                             load_weights;
     logic                             s_valid;
     logic                             s_ready;
     logic signed [DATA_WIDTH-1:0]     s_data;
@@ -100,6 +111,7 @@ module nn_accelerator_tb;
     ) dut (
         .clk        (clk),
         .rst        (rst),
+        .load_weights (load_weights),
         .s_valid    (s_valid),
         .s_ready    (s_ready),
         .s_data     (s_data),
@@ -150,7 +162,16 @@ module nn_accelerator_tb;
     // Coverage
     int unsigned cov_logit_pos = 0, cov_logit_neg = 0, cov_logit_zero = 0;
     int unsigned cov_act_sat = 0, cov_act_zero = 0, cov_act_mid = 0, cov_relu_zeroed = 0;
-    int unsigned cov_gap = 0, cov_backpressure = 0;
+    int unsigned cov_gap = 0, cov_backpressure = 0, cov_weight_reuse = 0;
+    int unsigned cov_reset_w1_load = 0;
+    // What the monitor should see for the job now running; the driver sets these
+    int unsigned exp_busy = 0, exp_in = 0, exp_out = 0;
+    string       exp_kind = "inference";
+    // Set while several inferences are in flight, where per-job beat and busy
+    // accounting does not apply (the monitor sees one continuous busy window).
+    bit          monitor_off = 1'b0;
+    longint      done_cycle [16];
+    int unsigned n_done = 0;
     int unsigned cov_reset_l1_load = 0, cov_reset_l1_calc = 0;
     int unsigned cov_reset_w2_load = 0, cov_reset_l2_calc = 0;
 
@@ -340,6 +361,11 @@ module nn_accelerator_tb;
             prev_m_data  = m_data;
             prev_m_last  = m_last;
 
+            // Layer 1 never reaches write-back during a weight load, which is
+            // what makes the !load_weights term in l1_m_ready redundant.
+            if (load_weights && dut.l1_m_valid)
+                error("layer 1 offered an activation during a weight load");
+
             if (s_valid && s_ready) job_in++;
             if (m_valid && m_ready) begin
                 job_out++;
@@ -352,12 +378,17 @@ module nn_accelerator_tb;
             if (done) begin
                 n_checks++;
                 if (prev_done) error("done high for more than one cycle");
-                if (job_in != HOST_BEATS || job_out != OUTPUT_SIZE || job_lasts != 1)
-                    error($sformatf("inference had %0d input beats, %0d logits, %0d m_last (expected %0d, %0d, 1)",
-                                    job_in, job_out, job_lasts, HOST_BEATS, OUTPUT_SIZE));
-                if (job_busy != BUSY_CYCLES + job_stalls)
-                    error($sformatf("inference busy for %0d cycles, expected %0d + %0d stalls",
-                                    job_busy, BUSY_CYCLES, job_stalls));
+                if (n_done < 16) done_cycle[n_done] = cycle;
+                n_done++;
+                if (!monitor_off) begin
+                if (job_in != exp_in || job_out != exp_out || job_lasts != (exp_out > 0 ? 1 : 0))
+                    error($sformatf("%s had %0d input beats, %0d logits, %0d m_last (expected %0d, %0d, %0d)",
+                                    exp_kind, job_in, job_out, job_lasts, exp_in, exp_out,
+                                    (exp_out > 0) ? 1 : 0));
+                if (job_busy != exp_busy + job_stalls)
+                    error($sformatf("%s busy for %0d cycles, expected %0d + %0d stalls",
+                                    exp_kind, job_busy, exp_busy, job_stalls));
+                end
                 last_busy       = job_busy;
                 last_period     = (last_done_cycle >= 0) ? cycle - last_done_cycle : 0;
                 last_done_cycle = cycle;
@@ -370,8 +401,8 @@ module nn_accelerator_tb;
     // -------------------------------------------------------------------------
     // Source and sink
     // -------------------------------------------------------------------------
-    // X, then W1 row-major, then W2 row-major
-    task automatic send(input int gap_pct, input int n_beats);
+    // A weight load sends W1 row-major then W2 row-major; an inference sends X.
+    task automatic send(input int gap_pct, input int n_beats, input bit is_weights);
         int value, e2;
         bit taken;
         for (int e = 0; e < n_beats; e++) begin
@@ -379,13 +410,12 @@ module nn_accelerator_tb;
                 s_valid = 1'b0;
                 @(negedge clk);
             end
-            if (e < INPUT_SIZE) begin
+            if (!is_weights) begin
                 value = x_vec[e];
-            end else if (e < L1_BEATS) begin
-                e2    = e - INPUT_SIZE;
-                value = w1_mat[e2 / HIDDEN_SIZE][e2 % HIDDEN_SIZE];
+            end else if (e < W1_BEATS) begin
+                value = w1_mat[e / HIDDEN_SIZE][e % HIDDEN_SIZE];
             end else begin
-                e2    = e - L1_BEATS;
+                e2    = e - W1_BEATS;
                 value = w2_mat[e2 / OUTPUT_SIZE][e2 % OUTPUT_SIZE];
             end
             s_valid = 1'b1;
@@ -445,10 +475,32 @@ module nn_accelerator_tb;
         $fwrite(results_fd, "\n");
     endtask
 
+    // Load W1 and W2 into the two layers; they stay resident.
+    task automatic load_weights_job(input int gap_pct);
+        exp_kind     = "weight load";
+        exp_busy     = W_BUSY;
+        exp_in       = W_BEATS;
+        exp_out      = 0;
+        load_weights = 1'b1;                       // held steady for the whole job
+        send(gap_pct, W_BEATS, 1'b1);
+        while (done !== 1'b1) @(negedge clk);      // a weight load produces no logits
+        load_weights = 1'b0;
+        n_jobs++;
+        @(negedge clk);                            // the monitor closes the job at this edge
+        n_checks += 2;
+        if (done !== 1'b0 || busy !== 1'b0) error("weight load: done or busy still high a cycle later");
+        if (last_busy < W_BUSY)
+            error($sformatf("weight load busy %0d cycles, expected %0d + stalls", last_busy, W_BUSY));
+    endtask
+
     task automatic run_job(input string name, input int gap_pct, input int stall_pct);
         compute_expected();
+        exp_kind = "inference";
+        exp_busy = INF_BUSY;
+        exp_in   = X_BEATS;
+        exp_out  = OUTPUT_SIZE;
         fork
-            send(gap_pct, HOST_BEATS);
+            send(gap_pct, X_BEATS, 1'b0);
             receive(name, stall_pct);
         join
         n_checks++;
@@ -460,14 +512,19 @@ module nn_accelerator_tb;
         if (done !== 1'b0 || busy !== 1'b0) error($sformatf("%s: done or busy still high a cycle later", name));
     endtask
 
-    task automatic directed_job(input string name, input bit back_to_back);
+    // Load this case's weights, then run one inference against them
+    task automatic directed_job(input string name, input bit unused_arg);
+        load_weights_job(0);
         run_job(name, 0, 0);
         n_checks++;
-        if (last_busy != BUSY_CYCLES)
-            error($sformatf("%s: busy %0d cycles, expected %0d", name, last_busy, BUSY_CYCLES));
-        if (back_to_back && last_period != longint'(PERIOD))
-            error($sformatf("%s: %0d cycles since the previous inference, expected %0d",
-                            name, last_period, PERIOD));
+        if (last_busy != INF_BUSY)
+            error($sformatf("%s: busy %0d cycles, expected %0d", name, last_busy, INF_BUSY));
+        if (unused_arg) begin end     // spacing is checked by the weight-reuse test
+    endtask
+
+    task automatic load_and_run(input string name, input int gap_pct, input int stall_pct);
+        load_weights_job(gap_pct);
+        run_job(name, gap_pct, stall_pct);
     endtask
 
     task automatic expect_logits(input longint value, input string name);
@@ -479,7 +536,8 @@ module nn_accelerator_tb;
     endtask
 
     task automatic apply_reset(input string where);
-        rst = 1'b1;
+        rst          = 1'b1;
+        load_weights = 1'b0;
         @(negedge clk);
         rst = 1'b0;
         n_checks++;
@@ -581,8 +639,8 @@ module nn_accelerator_tb;
         fill_random();
         directed_job("random, no stalls", 1'b1);
 
-        $display("  pass  every inference: busy %0d cycles; back to back %0d cycles apart",
-                 BUSY_CYCLES, PERIOD);
+        $display("  pass  every weight load: busy %0d cycles; every inference: %0d cycles",
+                 W_BUSY, INF_BUSY);
         section_end();
     endtask
 
@@ -590,19 +648,54 @@ module nn_accelerator_tb;
         section_begin("2. protocol: stalls and resets");
 
         fill_random();
-        run_job("input gaps", 50, 0);
+        load_and_run("input gaps", 50, 0);
         $display("  pass  input gaps (s_valid low 50%%): busy %0d cycles", last_busy);
         fill_random();
-        run_job("output backpressure", 0, 50);
+        load_and_run("output backpressure", 0, 50);
         $display("  pass  output backpressure (m_ready low 50%%): busy %0d cycles", last_busy);
         fill_random();
-        run_job("gaps and backpressure", 70, 70);
+        load_and_run("gaps and backpressure", 70, 70);
         $display("  pass  both (70%%): busy %0d cycles", last_busy);
 
-        // Reset at four points in the pipeline
+        // Weights loaded once, then several inferences: each costs only its own
+        // X beats and the two layers' compute, and they are PERIOD cycles apart.
+        fill_random();
+        load_weights_job(0);
+        for (int r = 0; r < 3; r++) begin
+            for (int k = 0; k < INPUT_SIZE; k++) x_vec[k] = rand_operand();
+            run_job($sformatf("weights reused, inference %0d", r), 0, 0);
+            n_checks++;
+            if (last_busy != INF_BUSY)
+                error($sformatf("reused-weight inference busy %0d cycles, expected %0d", last_busy, INF_BUSY));
+            if (r > 0) begin
+                n_checks++;
+                if (last_period != longint'(PERIOD))
+                    error($sformatf("inferences %0d cycles apart, expected %0d", last_period, PERIOD));
+            end
+        end
+        cov_weight_reuse++;
+        $display("  pass  weights loaded once, 3 inferences of %0d cycles, %0d apart", INF_BUSY, PERIOD);
+
+        // Reset at five points: two in a weight load, three in an inference
+        fill_random();
+        load_weights = 1'b1;
+        send(0, W1_BEATS / 2, 1'b1);             // partway through W1
+        apply_reset("W1 load");
+        cov_reset_w1_load++;
+        fill_random();
+        directed_job("after reset during W1 load", 1'b0);
+
+        fill_random();
+        load_weights = 1'b1;
+        send(0, W1_BEATS + W2_BEATS / 2, 1'b1);  // partway through W2
+        apply_reset("W2 load");
+        cov_reset_w2_load++;
+        fill_random();
+        directed_job("after reset during W2 load", 1'b0);
+
         fill_random();
         compute_expected();
-        send(0, L1_BEATS / 2);
+        send(0, X_BEATS / 2, 1'b0);
         apply_reset("layer 1 load");
         cov_reset_l1_load++;
         fill_random();
@@ -610,7 +703,7 @@ module nn_accelerator_tb;
 
         fill_random();
         compute_expected();
-        send(0, L1_BEATS);                       // layer 1 computes, layer 2 takes activations
+        send(0, X_BEATS, 1'b0);                  // layer 1 computes, layer 2 takes activations
         repeat (INPUT_SIZE) @(negedge clk);
         apply_reset("layer 1 compute");
         cov_reset_l1_calc++;
@@ -619,22 +712,85 @@ module nn_accelerator_tb;
 
         fill_random();
         compute_expected();
-        send(0, L1_BEATS + W2_BEATS / 2);        // partway through W2
-        apply_reset("W2 load");
-        cov_reset_w2_load++;
-        fill_random();
-        directed_job("after reset during W2 load", 1'b0);
-
-        fill_random();
-        compute_expected();
-        m_ready = 1'b0;
-        send(0, HOST_BEATS);
-        repeat (HIDDEN_SIZE) @(negedge clk);     // layer 2 computing
-        apply_reset("layer 2 compute");
+        m_ready = 1'b0;                          // the logits cannot drain, so this holds
+        send(0, X_BEATS, 1'b0);
+        repeat (GROUPS1*INPUT_SIZE + HIDDEN_SIZE + 2) @(negedge clk);
+        apply_reset("layer 2 busy");
         cov_reset_l2_calc++;
         fill_random();
-        directed_job("after reset during layer 2 compute", 1'b0);
+        directed_job("after reset during layer 2 busy", 1'b0);
 
+        section_end();
+    endtask
+
+    task automatic test_pipelined(input int n_stream);
+        int     idx = 0;
+        int     bad = 0;
+        int     gap = 0;
+        int     measured_ii = 0;
+        longint got;
+        section_begin($sformatf("2b. %0d inferences offered back to back", n_stream));
+
+        fill_random();
+        load_weights_job(0);
+        compute_expected();
+        monitor_off = 1'b0;
+        n_done      = 0;
+        monitor_off = 1'b1;
+        fork
+            begin                                   // source: never waits for done
+                for (int t = 0; t < n_stream; t++) send(0, X_BEATS, 1'b0);
+            end
+            begin                                   // sink: always ready
+                while (idx < n_stream * OUTPUT_SIZE) begin
+                    m_ready = 1'b1;
+                    if (m_valid && m_ready) begin
+                        got = longint'(m_data);
+                        n_checks += 2;
+                        if ($isunknown(m_data) || got != y_exp[idx % OUTPUT_SIZE]) begin
+                            bad++;
+                            if (bad <= 3)
+                                error($sformatf("pipelined: logit %0d of inference %0d = %0d, expected %0d",
+                                                idx % OUTPUT_SIZE, idx / OUTPUT_SIZE, got,
+                                                y_exp[idx % OUTPUT_SIZE]));
+                        end
+                        if (m_last !== ((idx % OUTPUT_SIZE) == OUTPUT_SIZE - 1))
+                            error($sformatf("pipelined: m_last = %b on logit %0d", m_last, idx));
+                        idx++;
+                    end
+                    @(negedge clk);
+                end
+                m_ready = 1'b0;
+            end
+        join
+        if (bad > 3) error($sformatf("pipelined: %0d mismatching logits in total", bad));
+        @(negedge clk);
+        monitor_off = 1'b0;
+
+        n_checks++;
+        if (n_done != n_stream)
+            error($sformatf("pipelined: %0d done pulses for %0d inferences", n_done, n_stream));
+        // Layer 1 runs ahead of layer 2 until its first write-back beat, which
+        // layer 2 can only take once it is back in LOAD. The run-ahead is the
+        // IDLE cycle, the X load and the first group's accumulation.
+        measured_ii = 0;
+        for (int t = 1; t < n_stream && t < 16; t++) begin
+            gap = int'(done_cycle[t] - done_cycle[t-1]);
+            n_checks += 3;
+            if (t > 1 && gap != measured_ii)
+                error($sformatf("pipelined: interval %0d cycles at inference %0d, %0d earlier -- not steady",
+                                gap, t, measured_ii));
+            // It must beat waiting for done, and it cannot beat the slower layer
+            if (gap >= PERIOD)
+                error($sformatf("pipelined: %0d cycles apart, no better than waiting for done (%0d)",
+                                gap, PERIOD));
+            if (gap < SLOWEST)
+                error($sformatf("pipelined: %0d cycles apart, faster than the slower layer alone (%0d)",
+                                gap, SLOWEST));
+            measured_ii = gap;
+        end
+        $display("  pass  same X %0d times, all logits correct, %0d cycles apart (%0d waiting for done; slower layer alone %0d)",
+                 n_stream, measured_ii, PERIOD, SLOWEST);
         section_end();
     endtask
 
@@ -642,8 +798,14 @@ module nn_accelerator_tb;
         logic [31:0] r;
         section_begin($sformatf("3. random (%0d inferences, seed %0d)", N_RANDOM, seed));
         for (int t = 0; t < N_RANDOM; t++) begin
-            fill_random();
             r = rand32();
+            if (t == 0 || r[7:6] == 2'b00) begin        // new weights for about a quarter
+                fill_random();
+                load_weights_job(stall_rate(r[1:0]));
+            end else begin                              // the rest reuse the resident ones
+                for (int k = 0; k < INPUT_SIZE; k++) x_vec[k] = rand_operand();
+                cov_weight_reuse++;
+            end
             repeat (int'(r[5:4])) @(negedge clk);
             run_job($sformatf("random %0d", t), stall_rate(r[1:0]), stall_rate(r[3:2]));
         end
@@ -659,8 +821,10 @@ module nn_accelerator_tb;
         cover_bin("activations 0 after requantizing",  cov_act_zero);
         cover_bin("activations between 1 and 126",     cov_act_mid);
         cover_bin("hidden values zeroed by ReLU",      cov_relu_zeroed);
+        cover_bin("inferences reusing resident weights", cov_weight_reuse);
         cover_bin("input gap cycles",                  cov_gap);
         cover_bin("backpressure cycles",               cov_backpressure);
+        cover_bin("reset during W1 load",              cov_reset_w1_load);
         cover_bin("reset during layer 1 load",         cov_reset_l1_load);
         cover_bin("reset during layer 1 compute",      cov_reset_l1_calc);
         cover_bin("reset during W2 load",              cov_reset_w2_load);
@@ -688,9 +852,10 @@ module nn_accelerator_tb;
         end
 
         $display("nn_accelerator_tb: %0d -> %0d (ReLU, >> %0d) -> %0d logits, %0d cycles per inference without stalls",
-                 INPUT_SIZE, HIDDEN_SIZE, SHIFT, OUTPUT_SIZE, BUSY_CYCLES);
+                 INPUT_SIZE, HIDDEN_SIZE, SHIFT, OUTPUT_SIZE, INF_BUSY);
 
-        rst        = 1'b1;
+        rst          = 1'b1;
+        load_weights = 1'b0;
         s_valid    = 1'b0;
         s_data     = '0;
         m_ready    = 1'b0;
@@ -706,6 +871,7 @@ module nn_accelerator_tb;
             $display("waveform run: sections 2-3 skipped; add +dumpall to run and record them");
         end else begin
             test_protocol();
+            test_pipelined(4);
             test_random();
             report_coverage();
         end

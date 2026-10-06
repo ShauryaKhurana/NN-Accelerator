@@ -52,10 +52,12 @@ module nn_layer_tb;
     localparam int ACC_WIDTH   = 32;
     localparam int CLK_PERIOD  = 10;
     localparam int MAX_ERRORS  = 10;
-    localparam int LOAD_BEATS  = INPUT_SIZE + INPUT_SIZE*OUTPUT_SIZE;
-    localparam int GROUPS      = (OUTPUT_SIZE + NUM_MACS - 1) / NUM_MACS;
-    localparam int BUSY_CYCLES = LOAD_BEATS + GROUPS*INPUT_SIZE + OUTPUT_SIZE + 1;
-    localparam int PERIOD      = BUSY_CYCLES + 1;
+    localparam int GROUPS    = (OUTPUT_SIZE + NUM_MACS - 1) / NUM_MACS;
+    localparam int X_BEATS   = INPUT_SIZE;                    // one inference's X
+    localparam int W_BEATS   = INPUT_SIZE*OUTPUT_SIZE;        // one weight load
+    localparam int W_BUSY    = W_BEATS + 1;
+    localparam int INF_BUSY  = X_BEATS + GROUPS*INPUT_SIZE + OUTPUT_SIZE + 1;
+    localparam int PERIOD    = INF_BUSY + 1;
 
     localparam longint ACC_MAX   = (longint'(1) << (ACC_WIDTH - 1)) - 1;
     localparam longint ACC_MIN   = -(longint'(1) << (ACC_WIDTH - 1));
@@ -67,6 +69,7 @@ module nn_layer_tb;
     // -------------------------------------------------------------------------
     logic                             clk = 1'b0;
     logic                             rst;
+    logic                             load_weights;
     logic                             s_valid;
     logic                             s_ready;
     logic signed [DATA_WIDTH-1:0]     s_data;
@@ -88,6 +91,7 @@ module nn_layer_tb;
     ) dut (
         .clk       (clk),
         .rst       (rst),
+        .load_weights (load_weights),
         .s_valid   (s_valid),
         .s_ready   (s_ready),
         .s_data    (s_data),
@@ -112,6 +116,8 @@ module nn_layer_tb;
     longint y_got [OUTPUT_SIZE];
 
     int unsigned n_checks = 0, n_errors = 0, n_jobs = 0, n_logged = 0;
+    // What the monitor should see for the job now running; the driver sets these
+    int unsigned exp_busy = 0, exp_in = 0, exp_out = 0;
     int unsigned sec_checks = 0, sec_errors = 0, sec_jobs = 0;
     int unsigned seed        = 1;
     logic [31:0] rng_state   = 32'h1;   // main sequence
@@ -135,7 +141,7 @@ module nn_layer_tb;
     int unsigned cov_y_pos = 0, cov_y_clamped = 0, cov_y_zero_exact = 0;
     int unsigned cov_bias_pos = 0, cov_bias_neg = 0, cov_bias_zero = 0;
     int unsigned cov_dot_pos = 0, cov_dot_neg = 0, cov_wrap = 0;
-    int unsigned cov_gap = 0, cov_backpressure = 0;
+    int unsigned cov_gap = 0, cov_backpressure = 0, cov_weight_reuse = 0;
     int unsigned cov_reset_load = 0, cov_reset_compute = 0, cov_reset_writeback = 0;
 
     // -------------------------------------------------------------------------
@@ -292,12 +298,12 @@ module nn_layer_tb;
             if (done) begin
                 n_checks++;
                 if (prev_done) error("done high for more than one cycle");
-                if (job_in != LOAD_BEATS || job_out != OUTPUT_SIZE || job_lasts != 1)
+                if (job_in != exp_in || job_out != exp_out || job_lasts != (exp_out > 0 ? 1 : 0))
                     error($sformatf("inference had %0d input beats, %0d output beats, %0d m_last (expected %0d, %0d, 1)",
-                                    job_in, job_out, job_lasts, LOAD_BEATS, OUTPUT_SIZE));
-                if (job_busy != BUSY_CYCLES + job_stalls)
+                                    job_in, job_out, job_lasts, exp_in, exp_out));
+                if (job_busy != exp_busy + job_stalls)
                     error($sformatf("inference busy for %0d cycles, expected %0d + %0d stalls",
-                                    job_busy, BUSY_CYCLES, job_stalls));
+                                    job_busy, exp_busy, job_stalls));
                 last_busy       = job_busy;
                 last_period     = (last_done_cycle >= 0) ? cycle - last_done_cycle : 0;
                 last_done_cycle = cycle;
@@ -312,7 +318,8 @@ module nn_layer_tb;
     // -------------------------------------------------------------------------
     // X, then W row-major. s_ready depends only on the DUT's state, so sampling
     // it at the falling edge tells whether the beat transfers on the next edge.
-    task automatic send(input int gap_pct, input int n_beats);
+    // is_weights selects W (a weight load) or X (an inference)
+    task automatic send(input int gap_pct, input int n_beats, input bit is_weights);
         int value;
         bit taken;
         for (int e = 0; e < n_beats; e++) begin
@@ -320,8 +327,8 @@ module nn_layer_tb;
                 s_valid = 1'b0;
                 @(negedge clk);
             end
-            value   = (e < INPUT_SIZE) ? x_vec[e]
-                                       : w_mat[(e - INPUT_SIZE) / OUTPUT_SIZE][(e - INPUT_SIZE) % OUTPUT_SIZE];
+            value   = is_weights ? w_mat[e / OUTPUT_SIZE][e % OUTPUT_SIZE]
+                                 : x_vec[e];
             s_valid = 1'b1;
             s_data  = DATA_WIDTH'(value);
             do begin
@@ -374,11 +381,31 @@ module nn_layer_tb;
         $fwrite(results_fd, "\n");
     endtask
 
+    // Load W into the DUT; it stays resident for the inferences that follow.
+    task automatic load_weights_job(input int gap_pct);
+        exp_busy     = W_BUSY;
+        exp_in       = W_BEATS;
+        exp_out      = 0;
+        load_weights = 1'b1;
+        send(gap_pct, W_BEATS, 1'b1);
+        load_weights = 1'b0;                       // already latched; only IDLE samples it
+        while (done !== 1'b1) @(negedge clk);      // a weight load produces no output
+        n_jobs++;
+        @(negedge clk);                            // the monitor closes the job at this edge
+        n_checks += 2;
+        if (done !== 1'b0 || busy !== 1'b0) error("weight load: done or busy still high a cycle later");
+        if (last_busy < W_BUSY)
+            error($sformatf("weight load busy %0d cycles, expected %0d + stalls", last_busy, W_BUSY));
+    endtask
+
     // log = 0 for the deliberately wrapping case, which the NumPy model rejects
     task automatic run_job(input string name, input int gap_pct, input int stall_pct, input bit log);
         compute_expected();
+        exp_busy = INF_BUSY;
+        exp_in   = X_BEATS;
+        exp_out  = OUTPUT_SIZE;
         fork
-            send(gap_pct, LOAD_BEATS);
+            send(gap_pct, X_BEATS, 1'b0);
             receive(name, stall_pct);
         join
         n_checks++;
@@ -390,15 +417,20 @@ module nn_layer_tb;
         if (done !== 1'b0 || busy !== 1'b0) error($sformatf("%s: done or busy still high a cycle later", name));
     endtask
 
-    // An inference with no stalls: busy and (optionally) the spacing must be exact
-    task automatic directed_job(input string name, input bit back_to_back);
+    // Load this case's weights, then run one inference with no stalls
+    task automatic directed_job(input string name, input bit unused_arg);
+        load_weights_job(0);
         run_job(name, 0, 0, 1'b1);
         n_checks++;
-        if (last_busy != BUSY_CYCLES)
-            error($sformatf("%s: busy %0d cycles, expected %0d", name, last_busy, BUSY_CYCLES));
-        if (back_to_back && last_period != longint'(PERIOD))
-            error($sformatf("%s: %0d cycles since the previous inference, expected %0d",
-                            name, last_period, PERIOD));
+        if (last_busy != INF_BUSY)
+            error($sformatf("%s: busy %0d cycles, expected %0d", name, last_busy, INF_BUSY));
+        if (unused_arg) begin end     // spacing is checked by the weight-reuse test
+    endtask
+
+    // Load weights, then one inference, both possibly stalled
+    task automatic load_and_run(input string name, input int gap_pct, input int stall_pct);
+        load_weights_job(gap_pct);
+        run_job(name, gap_pct, stall_pct, 1'b1);
     endtask
 
     task automatic expect_outputs(input longint value, input string name);
@@ -535,8 +567,8 @@ module nn_layer_tb;
                        APPLY_RELU ? "one past the safe bias wraps to negative, clamped to 0"
                                   : "one past the safe bias wraps to the most negative value");
 
-        $display("  pass  every inference: busy %0d cycles; back to back %0d cycles apart",
-                 BUSY_CYCLES, PERIOD);
+        $display("  pass  every weight load: busy %0d cycles; every inference: %0d cycles",
+                 W_BUSY, INF_BUSY);
         section_end();
     endtask
 
@@ -544,18 +576,39 @@ module nn_layer_tb;
         section_begin("2. protocol: stalls and resets");
 
         fill_random();
-        run_job("input gaps", 50, 0, 1'b1);
+        load_and_run("input gaps", 50, 0);
         $display("  pass  input gaps (s_valid low 50%%): busy %0d cycles", last_busy);
         fill_random();
-        run_job("output backpressure", 0, 50, 1'b1);
+        load_and_run("output backpressure", 0, 50);
         $display("  pass  output backpressure (m_ready low 50%%): busy %0d cycles", last_busy);
         fill_random();
-        run_job("gaps and backpressure", 70, 70, 1'b1);
+        load_and_run("gaps and backpressure", 70, 70);
         $display("  pass  both (70%%): busy %0d cycles", last_busy);
+
+        // Weights loaded once, then several inferences: each costs only its own
+        // X beats and compute, and they are PERIOD cycles apart.
+        fill_random();
+        load_weights_job(0);
+        for (int r = 0; r < 3; r++) begin
+            for (int k = 0; k < INPUT_SIZE; k++) x_vec[k] = rand_operand();
+            for (int j = 0; j < OUTPUT_SIZE; j++) bias_v[j] = rand_bias();   // bias is a parallel port
+            run_job($sformatf("weights reused, inference %0d", r), 0, 0, 1'b1);
+            n_checks++;
+            if (last_busy != INF_BUSY)
+                error($sformatf("reused-weight inference busy %0d cycles, expected %0d", last_busy, INF_BUSY));
+            if (r > 0) begin
+                n_checks++;
+                if (last_period != longint'(PERIOD))
+                    error($sformatf("inferences %0d cycles apart, expected %0d", last_period, PERIOD));
+            end
+        end
+        cov_weight_reuse++;
+        $display("  pass  weights loaded once, 3 inferences of %0d cycles, %0d apart", INF_BUSY, PERIOD);
 
         fill_random();
         compute_expected();
-        send(0, LOAD_BEATS / 2);
+        load_weights = 1'b0;
+        send(0, X_BEATS / 2, 1'b0);
         n_checks++;
         if (s_ready !== 1'b1) error("expected to be in LOAD");
         apply_reset("LOAD");
@@ -565,7 +618,7 @@ module nn_layer_tb;
 
         fill_random();
         compute_expected();
-        send(0, LOAD_BEATS);                                  // now computing
+        send(0, X_BEATS, 1'b0);                               // now computing
         repeat (INPUT_SIZE / 2) @(negedge clk);
         n_checks++;
         if (!(busy && !s_ready && !m_valid && !done)) error("expected to be computing");
@@ -577,7 +630,7 @@ module nn_layer_tb;
         fill_random();
         compute_expected();
         m_ready = 1'b0;
-        send(0, LOAD_BEATS);
+        send(0, X_BEATS, 1'b0);
         while (m_valid !== 1'b1) @(negedge clk);              // first output offered ...
         repeat (3) @(negedge clk);                            // ... and held
         apply_reset("WRITEBACK");
@@ -593,8 +646,15 @@ module nn_layer_tb;
         logic [31:0] r;
         section_begin($sformatf("3. random (%0d inferences, seed %0d)", N_RANDOM, seed));
         for (int t = 0; t < N_RANDOM; t++) begin
-            fill_random();
             r = rand32();
+            if (t == 0 || r[7:6] == 2'b00) begin        // new weights for about a quarter
+                fill_random();
+                load_weights_job(stall_rate(r[1:0]));
+            end else begin                              // the rest reuse the resident ones
+                for (int k = 0; k < INPUT_SIZE; k++) x_vec[k] = rand_operand();
+                for (int j = 0; j < OUTPUT_SIZE; j++) bias_v[j] = rand_bias();
+                cov_weight_reuse++;
+            end
             repeat (int'(r[5:4])) @(negedge clk);
             run_job($sformatf("random %0d", t), stall_rate(r[1:0]), stall_rate(r[3:2]), 1'b1);
         end
@@ -612,6 +672,7 @@ module nn_layer_tb;
         cover_bin("bias < 0",                          cov_bias_neg, 1'b1);
         cover_bin("bias = 0",                          cov_bias_zero, 1'b1);
         cover_bin("INT32 wrap (documented edge)",      cov_wrap, 1'b1);
+        cover_bin("inferences reusing resident weights", cov_weight_reuse, 1'b1);
         cover_bin("input gap cycles",                  cov_gap, 1'b1);
         cover_bin("backpressure cycles",               cov_backpressure, 1'b1);
         cover_bin("reset during LOAD",                 cov_reset_load, 1'b1);
@@ -640,10 +701,11 @@ module nn_layer_tb;
         end
 
         $display("nn_layer_tb: Y = %sX*W + B%s, %0d inputs -> %0d outputs, %0d cycles per inference without stalls",
-                 APPLY_RELU ? "ReLU(" : "", APPLY_RELU ? ")" : "", INPUT_SIZE, OUTPUT_SIZE, BUSY_CYCLES);
+                 APPLY_RELU ? "ReLU(" : "", APPLY_RELU ? ")" : "", INPUT_SIZE, OUTPUT_SIZE, INF_BUSY);
 
-        rst       = 1'b1;
-        s_valid   = 1'b0;
+        rst          = 1'b1;
+        load_weights = 1'b0;
+        s_valid      = 1'b0;
         s_data    = '0;
         m_ready   = 1'b0;
         bias_flat = '0;

@@ -78,21 +78,28 @@ signed INT32. The default is M = K = N = 8, and all three are parameters.
 ### Controller FSM
 
 ```
-          s_valid             last beat accepted          k == K-1
+          s_valid        last A beat (inference)            k == K-1
 +------+ -------> +------+ ---------------------> +---------+ ------> +-----------+
 | IDLE |          | LOAD |                        | COMPUTE |         | WRITEBACK |
 +------+          +------+                        +---------+ <------ +-----------+
-    ^                                                        m_ready,      |
-    |                                                        more left     | m_ready,
-    |               +------+                                               | last element
-    +---------------| DONE |<----------------------------------------------+
-                    +------+
+    ^                 |                                      m_ready,        |
+    |                 | last B beat (weight load)            more left       | m_ready,
+    |                 v                                                      | last element
+    |             +------+                                                   |
+    +-------------| DONE |<--------------------------------------------------+
+                  +------+
 ```
+
+A job is a weight load or an inference. `load_weights`, sampled with the first
+beat, picks which: a weight load takes K·N beats into the B region and goes
+straight to DONE, while an inference takes M·K beats of A and goes on to
+COMPUTE. The weights stay put between jobs.
 
 | State     | Leaves when                                   | Goes to   | Counters |
 |-----------|-----------------------------------------------|-----------|----------|
-| IDLE      | `s_valid`                                     | LOAD      | all cleared |
-| LOAD      | a beat is accepted and it was the last of M·K + K·N | COMPUTE | `ld_idx` + 1 per accepted beat |
+| IDLE      | `s_valid`                                     | LOAD      | all cleared; the job kind is latched from `load_weights`, and it sets the first load address |
+| LOAD      | the last of K·N beats (weight load)           | DONE      | `ld_idx` + 1 per accepted beat |
+| LOAD      | the last of M·K beats (inference)             | COMPUTE   | `ld_idx` + 1 per accepted beat |
 | COMPUTE   | `k == K-1` (after K cycles)                   | WRITEBACK | `k` + 1, wrapping to 0 |
 | WRITEBACK | `m_ready`, and the group has more columns     | WRITEBACK | `wb_sel` + 1 |
 | WRITEBACK | `m_ready`, group finished, more elements left | COMPUTE   | next group (`j_base` + NUM_MACS), then next row |
@@ -122,49 +129,65 @@ writes operands. This costs one cycle per job.
 
 ### Timing
 
-The start of a job, with no stalls (8×8×8):
+A weight load, with no stalls (8×8×8). It never leaves LOAD for COMPUTE:
 
 ```
-cycle      0      1      2    ...   128    129   ...   136    137    138   ...
-state     IDLE   LOAD   LOAD  ...   LOAD  COMPUTE ... COMPUTE  WB   COMPUTE ...
-s_valid    1      1      1           1      0
-s_ready    0      1      1           1      0
-beat              A00    A01         B77
-k                                          0     ...    7            0
-mac_clear                                  1                         1
-m_valid                                                         1
-m_data                                                        C00
+cycle          0      1      2    ...    64     65     66
+state         IDLE   LOAD   LOAD  ...   LOAD   DONE   IDLE
+load_weights   1      1      1           1
+s_valid        1      1      1           1      0
+s_ready        0      1      1           1      0
+beat                  B00    B01         B77
+done                                             1
 ```
 
-The end of the job: C[7][7] is computed in cycles 696–703. Its write-back
-beat is cycle 704, and DONE is cycle 705. In cycle 706 the next job's IDLE
-cycle can start.
+The start of an inference against those weights:
 
-With `NUM_MACS = 1`:
+```
+cycle          0      1      2    ...    64     65   ...    72     73     74   ...
+state         IDLE   LOAD   LOAD  ...   LOAD  COMPUTE ... COMPUTE  WB   COMPUTE ...
+load_weights   0      0      0           0
+s_valid        1      1      1           1      0
+s_ready        0      1      1           1      0
+beat                  A00    A01         A77
+k                                               0     ...    7            0
+mac_clear                                       1                         1
+m_valid                                                              1
+m_data                                                             C00
+```
 
-| Phase                       | Cycles (general)              | 8×8×8 |
-|-----------------------------|-------------------------------|-------|
-| IDLE, seeing `s_valid`      | 1                             | 1     |
-| LOAD                        | M·K + K·N                     | 128   |
-| COMPUTE + WRITEBACK         | M·N·(K + 1)                   | 576   |
-| DONE                        | 1                             | 1     |
-| **Job, back to back**       | **M·K + K·N + M·N·(K+1) + 2** | **706** |
+The end of the inference: C[7][7] is computed in cycles 632–639. Its
+write-back beat is cycle 640, and DONE is cycle 641. In cycle 642 the next
+inference's IDLE cycle can start.
 
-The general form, for any `NUM_MACS`, is
-`M·K + K·N + M·ceil(N/NUM_MACS)·K + M·N + 2`; at eight MACs an 8×8×8 job is
-258 cycles.
+Weights are loaded once and reused, so there are two kinds of job. With
+`NUM_MACS = 1`:
 
-- **Busy time.** `busy` is high for all but the IDLE cycle: 705 cycles for
-  8×8×8.
+| Job           | Phase                  | Cycles (general)          | 8×8×8 |
+|---------------|------------------------|---------------------------|-------|
+| Weight load   | IDLE, seeing `s_valid` | 1                         | 1     |
+|               | LOAD (B)               | K·N                       | 64    |
+|               | DONE                   | 1                         | 1     |
+|               | **back to back**       | **K·N + 2**               | **66** |
+| Inference     | IDLE, seeing `s_valid` | 1                         | 1     |
+|               | LOAD (A)               | M·K                       | 64    |
+|               | COMPUTE + WRITEBACK    | M·ceil(N/NUM_MACS)·K + M·N | 576  |
+|               | DONE                   | 1                         | 1     |
+|               | **back to back**       | **M·K + M·ceil(N/NUM_MACS)·K + M·N + 2** | **642** |
+
+At eight MACs an 8×8×8 inference is 194 cycles; the weight load is unchanged
+at 66.
+
+- **Busy time.** `busy` is high for all but the IDLE cycle: 65 cycles for a
+  weight load, 641 for an 8×8×8 inference.
 - **Stalls.** Every cycle with `s_valid` low during LOAD, or `m_ready` low
   during WRITEBACK, adds exactly one cycle. Both testbenches check this
   cycle for cycle, under random stalls.
-- **Measured job periods.** Back to back with no stalls: 706 cycles for
-  8×8×8, 385 for 3×16×5, and 282 for 1×16×8. Each matches the formula.
-- **Where the time goes (8×8×8).** Of the 706 cycles, the MAC is busy for
-  M·N·K = 512 (72.5%). The rest is loading (128 cycles), write-back beats
-  (64), and IDLE plus DONE (2). Overlapping these with computation, and
-  adding MACs, is the subject of Phases 7 and 8.
+- **Measured inference periods.** Back to back with no stalls: 642 cycles for
+  8×8×8, 305 for 3×16×5, and 154 for 1×16×8. Each matches the formula.
+- **Where the time goes (8×8×8).** Of the 642 inference cycles, the MAC is
+  busy for M·N·K = 512 (79.8%). The rest is loading A (64 cycles),
+  write-back beats (64), and IDLE plus DONE (2).
 
 ## Fully connected layer
 
@@ -209,18 +232,22 @@ ReLU is applied after the bias, so Y is never negative.
 
 ### Cycles per inference
 
-| Phase                       | Cycles (general)                                 | 16 → 8 |
-|-----------------------------|--------------------------------------------------|--------|
-| IDLE, seeing `s_valid`      | 1                                                | 1      |
-| LOAD (X then W)             | INPUT_SIZE + INPUT_SIZE·OUTPUT_SIZE              | 144    |
-| COMPUTE + WRITEBACK         | OUTPUT_SIZE · (INPUT_SIZE + 1)                   | 136    |
-| DONE                        | 1                                                | 1      |
-| **Back to back**            | **the sum of the above**                         | **282** |
+| Job         | Phase                  | Cycles (general)                    | 16 → 8 |
+|-------------|------------------------|-------------------------------------|--------|
+| Weight load | IDLE + LOAD (W) + DONE | INPUT_SIZE·OUTPUT_SIZE + 2          | 130    |
+| Inference   | IDLE, seeing `s_valid` | 1                                   | 1      |
+|             | LOAD (X)               | INPUT_SIZE                          | 16     |
+|             | COMPUTE + WRITEBACK    | OUTPUT_SIZE·(INPUT_SIZE + 1)        | 136    |
+|             | DONE                   | 1                                   | 1      |
+|             | **back to back**       | **the sum of the above**            | **154** |
 
-Measured back-to-back periods: 282 cycles at 16 → 8, 33 at 4 → 3, and 684 at
-32 → 10, each matching the formula. Loading the weights dominates: 144 of the
-282 cycles. A design that kept weights on-chip across inferences would not
-pay it every time, which is one of the things Phases 7 and 8 look at.
+The bias is a parallel INT32 port, not part of the stream, so it can change
+from one inference to the next without reloading anything.
+
+Measured back-to-back inference periods: 154 cycles at 16 → 8, 21 at 4 → 3,
+364 at 32 → 10, and 562 at 16 → 32, each matching the formula. Weight loading
+used to dominate this figure — 144 of 282 cycles — and has moved out of the
+per-inference path entirely.
 
 ## Requantizer
 
@@ -273,20 +300,25 @@ output layer produces raw logits.
 
 ### Cycles per inference
 
-| Phase                                             | Cycles                          | 16 → 32 → 10 |
-|---------------------------------------------------|---------------------------------|--------------|
-| IDLE, seeing the first beat                       | 1                               | 1            |
-| Layer 1 loads X and W1                            | INPUT_SIZE·(1 + HIDDEN_SIZE)    | 528          |
-| Layer 1 computes (+1 while layer 2 leaves IDLE)   | HIDDEN_SIZE·(INPUT_SIZE+1) + 1  | 545          |
-| Layer 2 loads W2                                  | HIDDEN_SIZE·OUTPUT_SIZE         | 320          |
-| Layer 2 computes                                  | OUTPUT_SIZE·(HIDDEN_SIZE+1)     | 330          |
-| DONE                                              | 1                               | 1            |
-| **Back to back**                                  | **the sum of the above**        | **1,725**    |
+A weight load streams W1 then W2; the host holds `load_weights` high for the
+whole job, and an internal beat counter splits the stream between the layers.
+An inference streams only X.
 
-Measured: 1,724 busy cycles and 1,725 between back-to-back inferences at
-16 → 32 → 10, and 48 at 4 → 3 → 2, both matching the formula. Of those 1,725
-cycles, 848 are spent loading weights and 874 computing, which is what Phases
-7 and 8 will attack.
+| Job         | Phase                                           | Cycles                          | 16 → 32 → 10 |
+|-------------|-------------------------------------------------|---------------------------------|--------------|
+| Weight load | layer 1 takes W1 (+ its DONE)                   | INPUT_SIZE·HIDDEN_SIZE + 1      | 513          |
+|             | layer 2 takes W2 (+ its DONE)                   | HIDDEN_SIZE·OUTPUT_SIZE + 1     | 321          |
+|             | **busy**                                        | **the sum of the above**        | **834**      |
+| Inference   | IDLE, seeing the first beat                     | 1                               | 1            |
+|             | layer 1 loads X                                 | INPUT_SIZE                      | 16           |
+|             | layer 1 computes (+1 while layer 2 leaves IDLE) | HIDDEN_SIZE·(INPUT_SIZE+1) + 1  | 545          |
+|             | layer 2 computes                                | OUTPUT_SIZE·(HIDDEN_SIZE+1)     | 330          |
+|             | DONE                                            | 1                               | 1            |
+|             | **back to back**                                | **the sum of the above**        | **893**      |
+
+Measured: 892 busy cycles and 893 between back-to-back inferences at
+16 → 32 → 10, and 30 at 4 → 3 → 2, both matching the formula. The weight load
+is paid once: 834 cycles, after which each inference costs 893.
 
 ## Parallel MACs
 
@@ -325,18 +357,152 @@ does not. Nor does weight loading, which is one byte per cycle.
 These are simulated cycle counts. No clock frequency is implied, and nothing
 here is an FPGA measurement.
 
-| NUM_MACS | Network cycles/inference | Speedup | Layer 16→32 cycles | Layer compute only |
-|----------|--------------------------|---------|--------------------|--------------------|
-| 1        | 1,725                    | 1.00×   | 1,074              | 544                |
-| 4        | 1,117                    | 1.54×   | 690                | 160                |
-| 8        | 1,021                    | 1.69×   | 626                | 96                 |
-| 16       | 957                      | 1.80×   | 594                | 64                 |
-| 32       | 941                      | 1.83×   | 578                | 48                 |
+| NUM_MACS | Network cycles/inference | Speedup | Weight load (once) |
+|----------|--------------------------|---------|--------------------|
+| 1        | 893                      | 1.00×   | 834                |
+| 4        | 285                      | 3.13×   | 834                |
+| 8        | 189                      | 4.72×   | 834                |
+| 16       | 125                      | 7.14×   | 834                |
+| 32       | 109                      | 8.19×   | 834                |
 
-The compute phase scales close to linearly: the 16→32 layer's compute falls
-from 544 cycles to 48, which is 11.3× with 32 MACs. The end-to-end figure does
-not, because weight loading is unchanged. For the network, 848 of the 1,725
-cycles at `NUM_MACS = 1` are weight beats, and at 32 MACs those 848 cycles are
-90% of the remaining 941. This is Amdahl's law with concrete numbers: past
-about 8 MACs, more multipliers buy very little, and the thing to fix is the
-one-byte-per-cycle weight port or reusing weights across inferences.
+The weight load is a fixed 834 cycles at every width: it is one byte per cycle
+through the same port, and more MACs do not widen it.
+
+These numbers are from Phase 8, with weights resident. Before that, every
+inference reloaded them, and the same sweep gave 1,725 / 1,117 / 1,021 / 957 /
+941 cycles — a 1.83× ceiling, because 848 of the 1,725 baseline cycles were
+weight beats and no number of MACs could shrink them. That was Amdahl's law
+with concrete numbers. Taking the weights out of the per-inference path raises
+the ceiling to 8.19×, and the two changes together take the 16-32-10 inference
+from 1,725 cycles to 109.
+
+## Pipelining, latency and throughput
+
+### Stages
+
+A value passes through four pieces of hardware on its way from the input
+stream to the output stream. Only two of them cost cycles:
+
+```
+  s_data ──▶ [1] operand    ──▶ [2] MAC     ──▶ [3] bias ──▶ [4] requantize ──▶ m_data /
+             memory             array           + ReLU        (INT32→INT8)      next layer
+             1 beat/cycle       K cycles        same cycle    same cycle
+             registered         registered      combinational combinational
+```
+
+Stages 3 and 4 add no cycles: they sit between the MAC's accumulator register
+and the output port, so a write-back beat is still one cycle per column. Only
+stage 1 (one beat per cycle) and stage 2 (K cycles per group of `NUM_MACS`
+columns) contribute to the cycle counts above.
+
+The two layers of the network overlap at their boundary. Layer 2's LOAD
+consumes activations in the same cycles layer 1's WRITEBACK produces them, so
+the pair costs less than the two run separately. Measured at `NUM_MACS = 1`:
+
+| Run                       | Busy cycles per inference |
+|---------------------------|---------------------------|
+| Layer 1 alone (16 → 32)   | 561                       |
+| Layer 2 alone (32 → 10)   | 363                       |
+| Sum, if not overlapped    | 924                       |
+| Network (16 → 32 → 10)    | **892**                   |
+
+The 32 cycles saved are exactly HIDDEN_SIZE: every activation is handed over
+in the cycle it is produced, with one extra cycle at the start while layer 2
+leaves IDLE.
+
+### Latency and initiation interval
+
+Latency is the busy window of one inference: 892 cycles for 16 → 32 → 10 at
+`NUM_MACS = 1`, of which the last is DONE. The initiation interval depends on
+how the host drives the input. If it waits for `done` before offering the next
+X, the interval is the latency plus one, because the FSM passes through IDLE.
+If it keeps the next X offered, layer 1 — a separate FSM — starts early and
+the interval is shorter. Both are measured:
+
+| NUM_MACS | Latency (busy) | Interval, waiting for `done` | Interval, X always offered | Throughput (inferences / 1000 cycles) |
+|----------|----------------|------------------------------|----------------------------|----------------------------------------|
+| 1        | 892            | 893                          | **860**                    | 1.16                                   |
+| 8        | 188            | 189                          | **156**                    | 6.41                                   |
+| 32       | 108            | 109                          | **76**                     | 13.16                                  |
+
+Throughput is one inference per interval, using the streamed figure. At the
+other widths in `make parallel`, the waiting-for-`done` intervals are 285 at
+four MACs and 125 at sixteen. The same effect on the small 4-3-2 network: 30 →
+22 at one MAC and 19 → 14 at four, against slower-layer periods of 21 and 13.
+
+Layer 1 runs ahead only until its own first write-back beat. There is no
+buffer between the layers — layer 1 writes activations straight into layer 2's
+operand memory — so it then stalls until layer 2 returns to LOAD. For
+16-32-10 the gain is a steady 33 cycles at every width, which is the IDLE
+cycle plus the X load plus the first group's accumulation. That is 3.7% of 893
+at one MAC but 30% of 109 at thirty-two, and at thirty-two it is enough to
+reach the slower layer's own period of 76 — fully pipelined, with layer 1
+never idle.
+
+The testbench measures this rather than assuming it: it offers the same X four
+times without waiting for `done`, checks every logit of every inference, and
+requires the interval to be steady, strictly shorter than waiting for `done`,
+and never shorter than the slower layer running alone.
+
+For the single matrix multiplier there is no such overlap — it is one FSM — and
+`matrix_mult_tb` checks it: a source that offers the next inference's first
+beat while the current one computes must see `s_ready` stay low, and the
+spacing must be exactly the documented interval.
+
+Weight loads are not in this path. One load of 834 cycles serves any number of
+inferences that follow, so a run of *n* inferences costs 834 + 860·*n* cycles
+at one MAC with the input kept fed, and 834 + 76·*n* at thirty-two. Before
+Phase 8 the same run cost 1,725·*n*.
+
+### MAC utilization
+
+Each layer instantiates its own `NUM_MACS` MACs, so the network holds
+2·`NUM_MACS` of them, and only one layer's array is active at a time. One
+16 → 32 → 10 inference needs 16·32 + 32·10 = 832 multiply-accumulates.
+
+Measured in steady state, over the interval with the input kept fed:
+
+| NUM_MACS | MAC slots in the active array | Useful | Utilization |
+|----------|-------------------------------|--------|-------------|
+| 1        | 1 × 860 = 860                 | 832    | 96.7%       |
+| 32       | 32 × 76 = 2,432               | 832    | 34.2%       |
+
+At one MAC the array is busy almost all the time. At thirty-two it is idle for
+two cycles in three: the input load, the activation handoff and the output
+beats do not shrink with `NUM_MACS`, and layer 2 only has 10 output columns,
+so 22 of its 32 MACs have nothing to do. This is the cost of the schedule, and
+it is visible in the table above as the drop from 7.14× to 8.19× between 16
+and 32 MACs.
+
+### Hazards
+
+- **Structural: no buffer between the layers.** Layer 1 writes each activation
+  straight into layer 2's operand memory, so it can only run ahead of layer 2
+  until its own first write-back beat, and then stalls. One activation buffer
+  between them would let layer 1 finish an inference while layer 2 works on
+  the previous one, bringing the interval down towards the slower layer's own
+  period at every width, not just at thirty-two MACs. Not implemented.
+- **Structural: one activation buffer per layer.** Each layer's operand memory
+  holds one inference's inputs, so a layer cannot load the next while still
+  reading the current. This is what bounds the run-ahead above.
+- **Structural: one output beat per cycle.** The result port is one column
+  wide whatever `NUM_MACS` is, so M·N write-back cycles never shrink. This is
+  the floor the utilization table runs into.
+- **Data: accumulator read-modify-write.** The MAC reads and writes its
+  accumulator every cycle. `clear` asserted together with `en` loads the first
+  product directly instead of adding it to a stale value, so consecutive
+  groups need no idle cycle between them.
+- **Data: the activation handoff.** Requantization is combinational, so layer
+  1's output reaches layer 2's input in the same cycle. Layer 2 must already
+  be in LOAD to accept it, and it is one cycle behind leaving IDLE — the `+1`
+  in the cycle table. After that the handoff runs at one activation per cycle.
+- **Control: no combinational handshake loops.** `s_ready` and `m_valid` are
+  decoded from the registered state alone (Moore), so `s_ready` never depends
+  on `s_valid` and `m_valid` never on `m_ready`. A stalled cycle therefore
+  costs exactly one cycle, which the testbenches check cycle by cycle under
+  random stalls.
+- **Weight coherence is the host's job.** Weights are resident state. The FSM
+  runs one job at a time, so a load cannot interleave with an inference, but
+  nothing in the hardware records whether weights were ever loaded: reset
+  returns the FSM to IDLE and leaves the operand memory untouched. A host that
+  infers before loading gets arithmetic on whatever was there.

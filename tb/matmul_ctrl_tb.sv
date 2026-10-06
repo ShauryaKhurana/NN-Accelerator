@@ -7,14 +7,20 @@
 //     from the transition table in matmul_ctrl.sv,
 //   * after the clock edge, the DUT's state and counters (ld_idx, i, j, k)
 //     must match the model.
-// For each job, busy must last exactly M*K + K*N + M*N*(K+1) + 1 cycles plus
-// one per stall cycle (s_valid low in LOAD, m_ready low in WRITEBACK).
+// A job is either a weight load (K*N beats, then DONE) or an inference (M*K
+// beats of A, then compute and write-back); load_weights picks which, and the
+// model latches it in IDLE exactly as the DUT does. Busy must last exactly
+// K*N + 1 cycles for a weight load and M*K + M*ceil(N/NUM_MACS)*K + M*N + 1
+// for an inference, plus one per stall cycle (s_valid low in LOAD, m_ready low
+// in WRITEBACK).
 //
 // Sections
-//   1. one job with no stalls        exact cycle count
+//   1. one of each job, no stalls    exact cycle counts
 //   2. stalls                        input gaps, output backpressure, both
-//   3. reset from each busy state    LOAD, COMPUTE, WRITEBACK, DONE
-//   4. random jobs                   N_JOBS jobs, random stall rates and gaps
+//   3. reset from each busy state    LOAD (both job kinds), COMPUTE,
+//                                    WRITEBACK, DONE
+//   4. random jobs                   N_JOBS inferences, weights reloaded for
+//                                    some of them, random stall rates
 //   +  coverage                      every legal transition, every reset
 // Note: s_valid and m_ready are driven as unconstrained random bits here. The
 // controller only counts handshakes; the full stream protocol is exercised by
@@ -40,12 +46,15 @@ module matmul_ctrl_tb;
     parameter int NUM_MACS = 1;
     parameter int N_JOBS   = 40;
 
-    localparam int LOAD_BEATS  = M*K + K*N;
-    localparam int GROUPS      = (N + NUM_MACS - 1) / NUM_MACS;
-    // per job, no stalls: load, then one group every K cycles plus one output
-    // beat per column, then DONE
-    localparam int BUSY_CYCLES = LOAD_BEATS + M*GROUPS*K + M*N + 1;
-    localparam int LW = $clog2(LOAD_BEATS);
+    localparam int A_BEATS     = M*K;                 // one inference's A
+    localparam int W_BEATS      = K*N;                // one weight load
+    localparam int MEM_BEATS    = A_BEATS + W_BEATS;  // operand-memory depth
+    localparam int GROUPS       = (N + NUM_MACS - 1) / NUM_MACS;
+    // no stalls: a weight load is its beats plus DONE; an inference loads A,
+    // then runs one group every K cycles plus one output beat per column
+    localparam int W_BUSY       = W_BEATS + 1;
+    localparam int INF_BUSY     = A_BEATS + M*GROUPS*K + M*N + 1;
+    localparam int LW = $clog2(MEM_BEATS);
     localparam int IW = (M > 1) ? $clog2(M) : 1;
     localparam int JW = (N > 1) ? $clog2(N) : 1;
     localparam int KW = (K > 1) ? $clog2(K) : 1;
@@ -57,6 +66,7 @@ module matmul_ctrl_tb;
     // -------------------------------------------------------------------------
     logic          clk = 1'b0;
     logic          rst;
+    logic          load_weights;
     logic          s_valid;
     logic          s_ready;
     logic          m_valid;
@@ -81,6 +91,7 @@ module matmul_ctrl_tb;
     ) dut (
         .clk       (clk),
         .rst       (rst),
+        .load_weights (load_weights),
         .s_valid   (s_valid),
         .s_ready   (s_ready),
         .m_valid   (m_valid),
@@ -105,6 +116,18 @@ module matmul_ctrl_tb;
     // -------------------------------------------------------------------------
     matmul_state_t exp_state = S_IDLE;
     int            exp_ld = 0, exp_i = 0, exp_jbase = 0, exp_k = 0, exp_wb = 0;
+    bit            exp_wjob = 1'b0;   // the running job is a weight load
+    bit            want_weights = 1'b0;  // what the driver asks for at the next IDLE
+
+    function automatic string job_kind();
+        if (exp_wjob) return "weight load";
+        else          return "inference";
+    endfunction
+
+    // Busy cycles the running job owes, before stalls
+    function automatic int exp_busy();
+        return exp_wjob ? W_BUSY : INF_BUSY;
+    endfunction
 
     // Last valid MAC in the current group (the tail group can be short), and
     // the column it streams out
@@ -129,6 +152,7 @@ module matmul_ctrl_tb;
     int unsigned trans [5][5];         // transition counts [from][to]
     int unsigned reset_from [5];       // resets applied in each state
     int unsigned cov_group_stream = 0; // extra columns streamed from one group
+    int unsigned cov_weight_load = 0, cov_inference = 0;
 
     // -------------------------------------------------------------------------
     // Helpers
@@ -187,9 +211,10 @@ module matmul_ctrl_tb;
         if ((exp_state == S_LOAD && !sv) || (exp_state == S_WRITEBACK && !mr)) job_stall++;
         if (exp_state == S_DONE) begin
             n_checks++;
-            if (job_busy != BUSY_CYCLES + job_stall)
-                error($sformatf("job busy for %0d cycles, expected %0d + %0d stalls",
-                                job_busy, BUSY_CYCLES, job_stall));
+            if (job_busy != exp_busy() + job_stall)
+                error($sformatf("%s busy for %0d cycles, expected %0d + %0d stalls",
+                                job_kind(), job_busy, exp_busy(), job_stall));
+            if (exp_wjob) cov_weight_load++; else cov_inference++;
             last_busy = job_busy;
             job_busy  = 0;
             job_stall = 0;
@@ -201,12 +226,20 @@ module matmul_ctrl_tb;
     task automatic model_advance(input bit sv, input bit mr);
         case (exp_state)
             S_IDLE: begin
-                exp_ld = 0; exp_i = 0; exp_jbase = 0; exp_k = 0; exp_wb = 0;
+                // The job kind is latched here, and it picks the first
+                // operand-memory address: A at 0, weights after A's region.
+                exp_wjob  = want_weights;
+                exp_ld    = want_weights ? A_BEATS : 0;
+                exp_i = 0; exp_jbase = 0; exp_k = 0; exp_wb = 0;
                 if (sv) exp_state = S_LOAD;
             end
             S_LOAD:
                 if (sv) begin
-                    if (exp_ld == LOAD_BEATS - 1) exp_state = S_COMPUTE;
+                    if (exp_wjob) begin
+                        if (exp_ld == MEM_BEATS - 1) exp_state = S_DONE;
+                    end else begin
+                        if (exp_ld == A_BEATS - 1)   exp_state = S_COMPUTE;
+                    end
                     exp_ld++;
                 end
             S_COMPUTE:
@@ -263,6 +296,7 @@ module matmul_ctrl_tb;
     // -------------------------------------------------------------------------
     task automatic step(input bit sv, input bit mr);
         matmul_state_t prev_state;
+        load_weights = want_weights;      // only IDLE samples it
         s_valid = sv;
         m_ready = mr;
         #1;                                   // let the combinational outputs settle
@@ -284,6 +318,7 @@ module matmul_ctrl_tb;
         n_cycles++;
         exp_state = S_IDLE;
         exp_ld = 0; exp_i = 0; exp_jbase = 0; exp_k = 0; exp_wb = 0;
+        exp_wjob  = 1'b0;
         job_busy  = 0;
         job_stall = 0;
         compare_model();
@@ -291,29 +326,42 @@ module matmul_ctrl_tb;
 
     // Run until one more job completes; each cycle, s_valid is low with
     // probability stall_in and m_ready is low with probability stall_out (%).
-    task automatic run_job(input int stall_in, input int stall_out);
+    task automatic run_one(input bit is_weights, input int stall_in, input int stall_out);
         int unsigned target = n_jobs + 1;
         int          guard  = 0;
-        while (n_jobs < target && guard < 50 * BUSY_CYCLES) begin
+        want_weights = is_weights;
+        while (n_jobs < target && guard < 50 * INF_BUSY) begin
             step(!chance(stall_in), !chance(stall_out));
             guard++;
         end
         if (n_jobs < target) error("job did not complete");
     endtask
 
+    task automatic run_job(input int stall_in, input int stall_out);       // inference
+        run_one(1'b0, stall_in, stall_out);
+    endtask
+
+    task automatic run_weights(input int stall_in);                        // weight load
+        run_one(1'b1, stall_in, 0);
+    endtask
+
     // Start a job, run it (no stalls) until the model reaches `target`, reset
     // there, and check that a clean job afterwards is exact.
-    task automatic reset_in(input matmul_state_t target);
-        int guard = 0;
-        while (exp_state != target && guard < 4 * BUSY_CYCLES) begin
+    task automatic reset_in(input matmul_state_t target, input bit during_weights);
+        int    guard = 0;
+        string note  = "";
+        if (during_weights) note = " (weight load)";
+        want_weights = during_weights;
+        while (exp_state != target && guard < 4 * INF_BUSY) begin
             step(1'b1, 1'b1);
             guard++;
         end
         reset_step();
         run_job(0, 0);
         n_checks++;
-        if (last_busy != BUSY_CYCLES) error("job after reset was not exact");
-        $display("  pass  reset in %s -> IDLE; next job exact (%0d busy cycles)", sname(target), last_busy);
+        if (last_busy != INF_BUSY) error("inference after reset was not exact");
+        $display("  pass  reset in %s%s -> IDLE; next inference exact (%0d busy cycles)",
+                 sname(target), note, last_busy);
     endtask
 
     // -------------------------------------------------------------------------
@@ -347,8 +395,8 @@ module matmul_ctrl_tb;
     task automatic end_test();
         $display("");
         if (n_errors == 0) begin
-            $display("TEST PASSED%s: matmul_ctrl_tb M=%0d K=%0d N=%0d NUM_MACS=%0d seed=%0d | %0d jobs, %0d cycles, %0d checks, 0 errors, %0d busy cycles per job",
-                     run_note, M, K, N, NUM_MACS, seed, n_jobs, n_cycles, n_checks, BUSY_CYCLES);
+            $display("TEST PASSED%s: matmul_ctrl_tb M=%0d K=%0d N=%0d NUM_MACS=%0d seed=%0d | %0d jobs, %0d cycles, %0d checks, 0 errors, %0d busy cycles per weight load, %0d per inference",
+                     run_note, M, K, N, NUM_MACS, seed, n_jobs, n_cycles, n_checks, W_BUSY, INF_BUSY);
             $finish;
         end else begin
             $display("TEST FAILED%s: matmul_ctrl_tb M=%0d K=%0d N=%0d seed=%0d | %0d errors in %0d checks",
@@ -361,17 +409,23 @@ module matmul_ctrl_tb;
     // Test sections
     // -------------------------------------------------------------------------
     task automatic test_no_stalls();
-        section_begin("1. one job, no stalls");
+        section_begin("1. one weight load and one inference, no stalls");
+        run_weights(0);
+        n_checks++;
+        if (last_busy != W_BUSY) error("weight-load busy cycles differ from the documented count");
+        $display("  pass  weight load busy for %0d cycles = K*N + 1 = %0d + 1", last_busy, W_BEATS);
         run_job(0, 0);
         n_checks++;
-        if (last_busy != BUSY_CYCLES) error("busy cycles differ from the documented count");
-        $display("  pass  busy for %0d cycles = (M*K + K*N) + M*N*(K+1) + 1 = %0d + %0d + 1",
-                 last_busy, LOAD_BEATS, M*N*(K + 1));
+        if (last_busy != INF_BUSY) error("inference busy cycles differ from the documented count");
+        $display("  pass  inference busy for %0d cycles = M*K + M*ceil(N/%0d)*K + M*N + 1 = %0d + %0d + %0d + 1",
+                 last_busy, NUM_MACS, A_BEATS, M*GROUPS*K, M*N);
         section_end();
     endtask
 
     task automatic test_stalls();
         section_begin("2. stalls: every stall cycle adds exactly one cycle");
+        run_weights(50);
+        $display("  pass  weight load with input gaps (50%%): busy %0d cycles", last_busy);
         run_job(50, 0);
         $display("  pass  input gaps (s_valid low 50%%): busy %0d cycles", last_busy);
         run_job(0, 50);
@@ -383,10 +437,11 @@ module matmul_ctrl_tb;
 
     task automatic test_resets();
         section_begin("3. reset from each busy state");
-        reset_in(S_LOAD);
-        reset_in(S_COMPUTE);
-        reset_in(S_WRITEBACK);
-        reset_in(S_DONE);
+        reset_in(S_LOAD, 1'b0);
+        reset_in(S_LOAD, 1'b1);        // a weight load's LOAD
+        reset_in(S_COMPUTE, 1'b0);
+        reset_in(S_WRITEBACK, 1'b0);
+        reset_in(S_DONE, 1'b0);
         section_end();
     endtask
 
@@ -404,6 +459,7 @@ module matmul_ctrl_tb;
         section_begin($sformatf("4. random jobs (%0d, seed %0d)", N_JOBS, seed));
         for (int n = 0; n < N_JOBS; n++) begin
             r = rand32();
+            if (n == 0 || r[7:6] == 2'b00) run_weights(stall_rate(r[1:0]));  // reload sometimes
             repeat (int'(r[5:4])) step(1'b0, r[6]);        // 0-3 idle cycles between jobs
             run_job(stall_rate(r[1:0]), stall_rate(r[3:2]));
         end
@@ -416,6 +472,7 @@ module matmul_ctrl_tb;
         cover_bin("IDLE -> LOAD",           trans[S_IDLE][S_LOAD],           1'b1);
         cover_bin("LOAD -> LOAD",           trans[S_LOAD][S_LOAD],           1'b1);
         cover_bin("LOAD -> COMPUTE",        trans[S_LOAD][S_COMPUTE],        1'b1);
+        cover_bin("LOAD -> DONE (weight load)", trans[S_LOAD][S_DONE],        1'b1);
         cover_bin("COMPUTE -> COMPUTE",     trans[S_COMPUTE][S_COMPUTE],     K > 1);
         cover_bin("COMPUTE -> WRITEBACK",   trans[S_COMPUTE][S_WRITEBACK],   1'b1);
         cover_bin("WRITEBACK -> WRITEBACK", trans[S_WRITEBACK][S_WRITEBACK], 1'b1);
@@ -427,6 +484,8 @@ module matmul_ctrl_tb;
         cover_bin("reset in WRITEBACK",     reset_from[S_WRITEBACK],         1'b1);
         cover_bin("reset in DONE",          reset_from[S_DONE],              1'b1);
         cover_bin("extra columns streamed from a group", cov_group_stream, NUM_MACS > 1 && N > 1);
+        cover_bin("weight loads completed",  cov_weight_load, 1'b1);
+        cover_bin("inferences completed",    cov_inference,   1'b1);
     endtask
 
     // -------------------------------------------------------------------------
@@ -444,11 +503,12 @@ module matmul_ctrl_tb;
             $dumpvars(0, matmul_ctrl_tb);
         end
 
-        $display("matmul_ctrl_tb: M=%0d K=%0d N=%0d NUM_MACS=%0d, %0d load beats, %0d busy cycles per job without stalls",
-                 M, K, N, NUM_MACS, LOAD_BEATS, BUSY_CYCLES);
+        $display("matmul_ctrl_tb: M=%0d K=%0d N=%0d NUM_MACS=%0d, weights resident; %0d busy cycles per weight load, %0d per inference, without stalls",
+                 M, K, N, NUM_MACS, W_BUSY, INF_BUSY);
 
-        rst     = 1'b1;
-        s_valid = 1'b0;
+        rst          = 1'b1;
+        load_weights = 1'b0;
+        s_valid      = 1'b0;
         m_ready = 1'b0;
         repeat (2) @(negedge clk);
         rst = 1'b0;
@@ -469,7 +529,7 @@ module matmul_ctrl_tb;
     end
 
     initial begin : watchdog
-        repeat ((N_JOBS + 20) * 50 * BUSY_CYCLES) @(posedge clk);
+        repeat ((N_JOBS + 20) * 50 * INF_BUSY) @(posedge clk);
         $display("TEST FAILED: matmul_ctrl_tb watchdog timeout");
         $fatal(1, "matmul_ctrl_tb timeout");
     end
