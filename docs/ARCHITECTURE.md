@@ -419,16 +419,18 @@ X, the interval is the latency plus one, because the FSM passes through IDLE.
 If it keeps the next X offered, layer 1 — a separate FSM — starts early and
 the interval is shorter. Both are measured:
 
-| NUM_MACS | Latency (busy) | Interval, waiting for `done` | Interval, X always offered | Throughput (inferences / 1000 cycles) |
-|----------|----------------|------------------------------|----------------------------|----------------------------------------|
-| 1        | 892            | 893                          | **860**                    | 1.16                                   |
-| 8        | 188            | 189                          | **156**                    | 6.41                                   |
-| 32       | 108            | 109                          | **76**                     | 13.16                                  |
+| NUM_MACS | Latency (busy) | Interval, waiting for `done` | Interval, X always offered | Slower layer alone | Throughput (inferences / 1000 cycles) |
+|----------|----------------|------------------------------|----------------------------|--------------------|----------------------------------------|
+| 1        | 892            | 893                          | **860**                    | 562                | 1.16                                   |
+| 4        | 284            | 285                          | **252**                    | 178                | 3.97                                   |
+| 8        | 188            | 189                          | **156**                    | 114                | 6.41                                   |
+| 16       | 124            | 125                          | **92**                     | 82                 | 10.87                                  |
+| 32       | 108            | 109                          | **76**                     | 76                 | 13.16                                  |
 
-Throughput is one inference per interval, using the streamed figure. At the
-other widths in `make parallel`, the waiting-for-`done` intervals are 285 at
-four MACs and 125 at sixteen. The same effect on the small 4-3-2 network: 30 →
-22 at one MAC and 19 → 14 at four, against slower-layer periods of 21 and 13.
+Throughput is one inference per interval, using the streamed figure. `make
+perf` regenerates this sweep and writes [PERFORMANCE.md](PERFORMANCE.md) from
+it. The same overlap on the small 4-3-2 network: 30 → 22 at one MAC and
+19 → 14 at four, against slower-layer periods of 21 and 13.
 
 Layer 1 runs ahead only until its own first write-back beat. There is no
 buffer between the layers — layer 1 writes activations straight into layer 2's
@@ -437,7 +439,7 @@ operand memory — so it then stalls until layer 2 returns to LOAD. For
 cycle plus the X load plus the first group's accumulation. That is 3.7% of 893
 at one MAC but 30% of 109 at thirty-two, and at thirty-two it is enough to
 reach the slower layer's own period of 76 — fully pipelined, with layer 1
-never idle.
+never idle. At sixteen MACs it comes close, 92 against a floor of 82.
 
 The testbench measures this rather than assuming it: it offers the same X four
 times without waiting for `done`, checks every logit of every inference, and
