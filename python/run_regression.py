@@ -282,9 +282,25 @@ def run(cmd, what, quiet):
     return proc.stdout
 
 
-def simulate(dut, sim, shape, shift, num_macs, vectors, results, seed, stalls, quiet):
+def lz4_flags():
+    """Verilator's FST writer includes <lz4.h>, which Homebrew does not put on
+    the default include path."""
+    try:
+        prefix = subprocess.run(["brew", "--prefix", "lz4"], capture_output=True,
+                                text=True).stdout.strip()
+    except OSError:
+        return []
+    if prefix and (Path(prefix) / "include" / "lz4.h").exists():
+        return ["-CFLAGS", f"-I{prefix}/include", "-LDFLAGS", f"-L{prefix}/lib"]
+    return []
+
+
+def simulate(dut, sim, shape, shift, num_macs, vectors, results, seed, stalls, quiet,
+             waves=None, max_cases=0):
     top = dut["top"]
-    build = ROOT / "sim" / sim / top
+    # A traced build is a different binary, so keep it out of the normal one's
+    # directory rather than forcing a rebuild on every switch.
+    build = ROOT / "sim" / sim / (top + ("_waves" if waves else ""))
     build.mkdir(parents=True, exist_ok=True)
     params = dict(dut["params"](shape, shift), NUM_MACS=num_macs)
 
@@ -292,6 +308,11 @@ def simulate(dut, sim, shape, shift, num_macs, vectors, results, seed, stalls, q
         cmd = ["verilator", "--binary", "-j", "0", "--x-initial", "unique", "--quiet",
                "--unroll-count", "1", "-CFLAGS", "-Wno-unknown-warning-option",
                "--top-module", top, "--Mdir", str(build)]
+        if waves:
+            if waves.suffix == ".fst":
+                cmd += ["--trace-fst"] + lz4_flags()
+            else:
+                cmd += ["--trace"]
         cmd += [f"-G{k}={v}" for k, v in params.items()] + dut["rtl"] + [dut["tb"]]
         if run(cmd, f"{sim} build", quiet) is None:
             return None
@@ -307,6 +328,10 @@ def simulate(dut, sim, shape, shift, num_macs, vectors, results, seed, stalls, q
     sim_cmd += [f"+seed={seed}", f"+vectors={vectors}", f"+resultsfile={results}"]
     if stalls:
         sim_cmd.append("+stalls")
+    if waves:
+        sim_cmd.append(f"+dumpfile={waves}")
+    if max_cases:
+        sim_cmd.append(f"+maxcases={max_cases}")
     return run(sim_cmd, "simulation", quiet)
 
 
@@ -339,8 +364,14 @@ def regress(name, args):
     if args.keep:
         print(f"  vectors {vectors.relative_to(ROOT)}  results {results.relative_to(ROOT)}")
 
+    waves = None
+    if args.waves:
+        wave_dir = ROOT / "waveforms"
+        wave_dir.mkdir(exist_ok=True)
+        waves = wave_dir / f"regression_{name}.{args.waves}"
     stdout = simulate(dut, args.sim, shape, args.shift, args.num_macs,
-                      vectors, results, args.seed, args.stalls, args.quiet)
+                      vectors, results, args.seed, args.stalls, args.quiet,
+                      waves, args.max_cases)
     if stdout is None:
         return False
     for line in stdout.splitlines():
@@ -354,8 +385,10 @@ def regress(name, args):
         dims, cases = parse_results(results, dut["kind"])
         if dims != dut["dims"](shape, args.shift):
             raise ResultsError(f"{results}: dims {dims}, expected {dut['dims'](shape, args.shift)}")
-        if len(cases) != len(labels):
-            raise ResultsError(f"{results}: {len(cases)} cases, expected {len(labels)}")
+        expected = min(len(labels), args.max_cases) if args.max_cases else len(labels)
+        if len(cases) != expected:
+            raise ResultsError(f"{results}: {len(cases)} cases, expected {expected}")
+        labels = labels[:expected]
         mismatches, n_values = dut["check"](cases, shape, args.shift, labels)
     except (OSError, ResultsError) as exc:
         print(f"regression [{name}]: FAIL - {exc}")
@@ -373,8 +406,11 @@ def regress(name, args):
     if not args.keep:
         vectors.unlink(missing_ok=True)
         results.unlink(missing_ok=True)
-    print(f"regression [{name}]: PASS - {len(labels)} {dut['unit']} "
-          f"({n_random} randomized), {n_values} values match NumPy")
+    if waves:
+        print(f"  wrote {waves.relative_to(ROOT)}")
+    print(f"regression [{name}]: PASS - {len(labels)} {dut['unit']}"
+          f"{'' if args.max_cases else f' ({n_random} randomized)'}, "
+          f"{n_values} values match NumPy")
     return True
 
 
@@ -393,6 +429,10 @@ def main(argv=None):
                     help="drive random input gaps and output backpressure")
     ap.add_argument("--keep", action="store_true", help="keep the vector and results files")
     ap.add_argument("--quiet", action="store_true", help="do not echo the build commands")
+    ap.add_argument("--waves", choices=("vcd", "fst"), default=None,
+                    help="write waveforms/regression_<dut>.<fmt>; pair with --max-cases")
+    ap.add_argument("--max-cases", type=int, default=0,
+                    help="stop the simulation after n cases (0 = all); for small traces")
     args = ap.parse_args(argv)
 
     if args.cases < 1:

@@ -20,7 +20,7 @@ next one starts.
 | 7     | Parallel MAC array             | done — verified on Verilator and Icarus, and against NumPy |
 | 8     | Weight reuse + pipelining      | done — verified on Verilator and Icarus, and against NumPy |
 | 9     | Python-driven random regression| done — verified on Verilator and Icarus, and against NumPy |
-| 10    | Waveform tooling               | not started |
+| 10    | Waveform tooling               | done — VCD and FST, verified in Surfer 0.7.0 |
 | 11    | Performance report             | not started |
 | 12    | Documentation                  | not started |
 
@@ -595,3 +595,61 @@ from a 15-bit product. The network reports ten differing logits per case with
 the cause two layers back. The matmul DUT also checks far more values for the
 same number of cases, 64,640 against 10,150, because nothing is reduced to
 INT8 on the way out.
+
+## Phase 10: waveforms
+
+Every testbench can write a waveform, in VCD or FST. Nothing is dumped unless
+asked for, so the normal test runs stay fast.
+
+```sh
+make waves                      # every testbench, VCD
+make waves WAVE_FORMAT=fst      # every testbench, FST
+make net-waves                  # just the network
+surfer waveforms/nn_accelerator_tb.fst
+```
+
+The Python regression can trace too, with a case limit to keep it small:
+
+```sh
+.venv/bin/python python/run_regression.py --waves fst --max-cases 3
+```
+
+**Measured sizes** for the same eight runs:
+
+| | VCD | FST |
+|---|---|---|
+| Network testbench | 2.6 MB | 147 KB |
+| Matrix multiply | 2.0 MB | 103 KB |
+| All eight runs | ~7.9 MB | ~427 KB |
+
+FST is roughly 18x smaller. It is a compile-time choice in Verilator, so
+switching `WAVE_FORMAT` triggers a rebuild, and it needs `lz4`
+(`brew install lz4`) — the Makefile finds Homebrew's headers itself, since
+they are not on Apple clang's default search path.
+
+**Three traps worth knowing**, all hit while building this:
+
+- **Icarus Verilog only writes VCD.** Hand it a `.fst` filename and it writes
+  VCD content into it and reports success, producing a file no viewer opens.
+  The FST targets are Verilator-only for that reason.
+- **`$dumpoff` is ignored** by Verilator, so a testbench cannot pause its own
+  dump. The waveform targets therefore run section 1 only, and the regression
+  takes `--max-cases`.
+- **Large arrays are dropped silently.** Under Verilator's defaults (32
+  entries, 256 bits) the operand memory holding the resident weights simply
+  does not appear in the trace — not truncated, absent. The Makefile raises
+  `--trace-max-array` and `--trace-max-width` so the weights are visible.
+
+**Signals.** [`docs/WAVEFORMS.md`](docs/WAVEFORMS.md) lists what to look at
+and where, with the paths checked against a real dump: clock, reset, cycle
+counter, `load_weights`, both handshakes, the FSM state (with its encoding),
+`ld_idx`/`ld_en`, `mac_en`/`mac_clear`, the operand indices `i`/`j_base`/`k`,
+`wb_sel`, the MAC accumulator, the resident weights in `op_mem`, and the
+requantized activation between the layers. It also covers how to read a
+weight load against an inference, and what the two layers' overlap looks like.
+
+**Viewers.** Verified with Surfer 0.7.0, which is installed here and loads
+both formats. GTKWave is the viewer the brief names but is not installed, so
+its commands in `docs/WAVEFORMS.md` come from its documentation rather than
+from a run here; it is `brew install --cask gtkwave`, and it also brings
+`vcd2fst` for converting an Icarus dump after the fact.
